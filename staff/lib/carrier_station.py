@@ -138,7 +138,7 @@ def recommend_carrier_station(pm: Dict[str, Any],
         "carrier_tf_positions": [
             {"tf": c.get("tf"), "hex": list(c.get("hex") or [])} for c in carrier_positions
         ],
-        "doctrine_ref": "零·第一级（死守 PM）；第二级为从属考量，无权否决第一级",
+        "doctrine_ref": "核心战略目标优先；兵力保全为从属考量，无权否决核心战略目标",
         "risk_notes": [],
     }
 
@@ -229,7 +229,7 @@ def recommend_carrier_station(pm: Dict[str, Any],
         "本回合无敌航母目击。**不预设敌方兵力构成**（剧本每回合有随机性，"
         "对手未必按历史策略或历史位置行动）——一律以当回合侦察确认的情报为准；无情报则保持搜索，不做无谓规避。")
     out["risk_notes"].append(
-        "本条为参谋部建议，**不自动纠偏**；按严格字典序，第二级（保航母）无权否决第一级（死守 PM），"
+        "本条为参谋部建议，**不自动纠偏**；按指挥官战略层级，兵力保全不得单方面否决核心战役目标，"
         "前推位由指挥层审核后执行。")
     return out
 
