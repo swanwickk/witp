@@ -1,0 +1,267 @@
+{
+  "_comment": "命令字段标定成果。每条均由「GUI改设置→存档→差分」或「改字节→载入→界面确认」实证。",
+  "_verified_at": "2026-10-18",
+  "TF_PWSTaskGroup_556B": {
+    "flagship": {
+      "off": 44,
+      "type": "i32",
+      "note": "旗舰舰船 id"
+    },
+    "home_port": {
+      "off": 54,
+      "type": "u16",
+      "note": "母港 Location id"
+    },
+    "dest_base": {
+      "off": 58,
+      "type": "u16",
+      "note": "目的基地 id（界面缓存，单独改无效）"
+    },
+    "waypoints": {
+      "off": 118,
+      "type": "u16x2 x40",
+      "note": "航路点数组"
+    },
+    "wp_count": {
+      "off": 320,
+      "type": "u16",
+      "note": "路径有效点数"
+    },
+    "wp_alloc": {
+      "off": 322,
+      "type": "u16",
+      "note": "路径缓冲长度"
+    },
+    "mission": {
+      "off": 349,
+      "type": "u8",
+      "note": "任务码",
+      "evidence": "改349=2→界面 Mission: Surface Combat"
+    },
+    "speed": {
+      "off": 354,
+      "type": "u8",
+      "note": "速度档；Undock 会把 3 变 0"
+    },
+    "routing": {
+      "off": 369,
+      "type": "u8",
+      "note": "TFRouting 0=Normal 1=Safest",
+      "evidence": "GUI设Safest→0→1；改回0→'Safest Route Ordered'文本消失"
+    },
+    "threat_tolerance": {
+      "off": 448,
+      "type": "u8",
+      "note": "0=Normal 1=Low 2=High 3=Absolute",
+      "evidence": "GUI点High→0→2；off448=3→界面Absolute绿色高亮"
+    },
+    "max_react": {
+      "off": 355,
+      "type": "u8",
+      "note": "最大反应半径 0-6",
+      "evidence": "GUI 把 MaxReact 0→6 后 off355 由 0 变 6；改回 2 → 界面 Max React: 2"
+    },
+    "load_state": {
+      "off": 350,
+      "type": "u8",
+      "note": "装载状态 0/99=空闲 1=正在装载 2=卸载",
+      "evidence": "GUI 点 Load Supplies → off350 99→1，界面 'loading supplies'；改回 0 → Cargo Status idle"
+    }
+  },
+  "TF_Location_mirror_14007": {
+    "_note": "TF 在 Loc 表 14001-14030 有镜像记录（带名字，如 MO Landing Force=TF7）。但命令字段位置尚未标定。",
+    "_retracted": "早前把 off685 当 max_react —— 错误。证据：写入685=3后界面仍显示 MaxReact:0，且游戏载入未改该字节。",
+    "home_port": {
+      "off": 660,
+      "type": "u16",
+      "note": "213,3 = 992 Rabaul"
+    },
+    "dest_x": {
+      "off": 662,
+      "type": "u16"
+    },
+    "dest_y": {
+      "off": 664,
+      "type": "u16"
+    },
+    "dest_x2": {
+      "off": 760,
+      "type": "u16"
+    },
+    "dest_y2": {
+      "off": 762,
+      "type": "u16"
+    }
+  },
+  "AG_PWSAirGroup_680B": {
+    "base_id": {
+      "off": 40,
+      "type": "u16"
+    },
+    "reinforce_base_id": {
+      "off": 42,
+      "type": "u16",
+      "note": "转场目标基地（手册7.2.3）"
+    },
+    "primary": {
+      "off": 44,
+      "type": "u16"
+    },
+    "secondary": {
+      "off": 46,
+      "type": "u16"
+    },
+    "target_id": {
+      "off": 48,
+      "type": "u16"
+    },
+    "targetX": {
+      "off": 192,
+      "type": "u16"
+    },
+    "targetY": {
+      "off": 196,
+      "type": "u16"
+    },
+    "alt": {
+      "off": 212,
+      "type": "u16"
+    },
+    "withdraw": {
+      "off": 392,
+      "type": "u32",
+      "note": "撤编日期 YYMMDD，引擎排定只读"
+    },
+    "pctCAP": {
+      "off": 560,
+      "type": "u8"
+    },
+    "pctLRCAP": {
+      "off": 561,
+      "type": "u8"
+    },
+    "pctASW": {
+      "off": 562,
+      "type": "u8"
+    },
+    "pctSearch": {
+      "off": 563,
+      "type": "u8"
+    },
+    "pctTrain": {
+      "off": 564,
+      "type": "u8"
+    },
+    "pctRest": {
+      "off": 565,
+      "type": "u8"
+    },
+    "aswArcStart": {
+      "off": 628,
+      "type": "u8"
+    },
+    "aswArcEnd": {
+      "off": 629,
+      "type": "u8"
+    },
+    "navArcStart": {
+      "off": 630,
+      "type": "u8"
+    },
+    "navArcEnd": {
+      "off": 631,
+      "type": "u8"
+    },
+    "max_planes": {
+      "off": 245,
+      "type": "u8",
+      "note": "编制数 Resize（手册 7.3）",
+      "evidence": "EI-1 Daitai 19→24，CV Shokaku 面板显示 '19 (3) x A6M2 Zero (24)'"
+    }
+  },
+  "LOC_PWSLocation_1172B": {
+    "X": {
+      "off": 36,
+      "type": "u16"
+    },
+    "Y": {
+      "off": 38,
+      "type": "u16"
+    },
+    "prepTarget": {
+      "off": 102,
+      "type": "u16",
+      "note": "准备目标基地 Location ID",
+      "evidence": "prep 40→41 过回合真增长"
+    },
+    "prep": {
+      "off": 104,
+      "type": "u16"
+    },
+    "combatMode": {
+      "off": 110,
+      "type": "u8",
+      "note": "0=defend 1=bombardment 2=deliberate 3=shock"
+    },
+    "portExpand": {
+      "off": 424,
+      "type": "u16"
+    },
+    "airfieldExpand": {
+      "off": 428,
+      "type": "u16"
+    },
+    "fortExpand": {
+      "off": 432,
+      "type": "u16"
+    },
+    "marchDir": {
+      "off": 651,
+      "type": "u8"
+    },
+    "marchLen": {
+      "off": 652,
+      "type": "u8"
+    },
+    "destX": {
+      "off": 662,
+      "type": "u16",
+      "note": "地面部队行军目的地"
+    },
+    "destY": {
+      "off": 664,
+      "type": "u16"
+    },
+    "operationsMode": {
+      "off": 906,
+      "type": "u16",
+      "note": "Operations Mode（手册 8.2.1.1）",
+      "evidence": "GUI 把 11th Air Fleet 由 Combat 改 Move → off906 0→1；写 4 → 界面 OpMode 列显示 Rest"
+    }
+  },
+  "SHIP_PWSShip_464B": {
+    "repairPriority": {
+      "off": 338,
+      "type": "u8"
+    },
+    "repairMode": {
+      "off": 339,
+      "type": "u8"
+    },
+    "upgrade": {
+      "off": 365,
+      "type": "u8"
+    }
+  },
+  "_unlocated": [
+    "TFRetirement（撤退状态）—— 实证不进存档，纯运行时",
+    "Follow TF / Meet TF —— GUI 改后存档零差异，纯运行时",
+    "Set Patrol Zone（Boundary 1/2/3）—— 需先清目的地，GUI 入口受限",
+    "组建/解散 TF、舰船转移",
+    "AG 机型升级 upgradeTo/agrUpgrade（已定位偏移但语义未验证）",
+    "飞行员管理",
+    "基地 HQ 变更 / 补给请求",
+    "舰船改装 Conversions",
+    "政治点换将"
+  ]
+}

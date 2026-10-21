@@ -1,0 +1,1431 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WitP 战略推演看板</title>
+<style>
+/* ===== 设计令牌：完全对齐 Hermes Studio 暗色主题 ===== */
+:root {
+  --font-size-base: 14px;
+  --bg-primary: #1a1a1a;
+  --bg-secondary: #252525;
+  --bg-sidebar: #202020;
+  --bg-card: #2a2a2a;
+  --bg-card-rgb: 42, 42, 42;
+  --bg-card-hover: #333;
+  --bg-input: #2a2a2a;
+  --border-color: #3a3a3a;
+  --border-light: #333;
+  --accent-primary: #e0e0e0;
+  --accent-primary-rgb: 224, 224, 224;
+  --accent-hover: #f5f5f5;
+  --accent-muted: #888;
+  --text-primary: #e0e0e0;
+  --text-secondary: #a0a0a0;
+  --text-muted: #888;
+  --success: #66bb6a;
+  --error: #ef5350;
+  --warning: #ffb74d;
+  --accent-info: #6ba3d6;
+  --code-bg: #1e1e1e;
+  --text-on-accent: #1a1a1a;
+  --mono: JetBrains Mono, Fira Code, Consolas, "Liberation Mono", monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+html, body {
+  width: 100%; max-width: 100vw; overflow-x: hidden;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: var(--font-size-base);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  line-height: 1.5;
+}
+::-webkit-scrollbar { width: 6px; height: 6px; background: transparent; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ===== 顶栏 ===== */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-sidebar);
+  position: sticky; top: 0; z-index: 50;
+}
+.topbar-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.topbar-title { font-size: 15px; font-weight: 600; color: var(--text-primary); white-space: nowrap; }
+.topbar-right { display: flex; align-items: center; gap: 8px; }
+
+/* ===== 模型选择：拉出式侧边栏（Studio 组件样式） ===== */
+.model-trigger {
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  display: flex; align-items: center; gap: 6px;
+  min-width: 150px; max-width: 240px; min-height: 32px;
+  transition: border-color .15s;
+  font-family: inherit;
+}
+.model-trigger:hover { border-color: var(--accent-muted); }
+.model-name {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  text-align: start; font-family: var(--mono); font-size: 12px;
+}
+.model-arrow { color: var(--text-muted); flex-shrink: 0; font-size: 10px; }
+
+/* 遮罩 */
+.drawer-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.5);
+  z-index: 200;
+  opacity: 0; visibility: hidden;
+  transition: opacity .2s, visibility .2s;
+}
+.drawer-overlay.open { opacity: 1; visibility: visible; }
+
+/* 侧边栏本体 */
+.drawer {
+  position: fixed; top: 0; right: 0;
+  width: 380px; max-width: 100vw; height: 100%;
+  background: var(--bg-sidebar);
+  border-left: 1px solid var(--border-color);
+  z-index: 201;
+  display: flex; flex-direction: column;
+  transform: translateX(100%);
+  transition: transform .22s cubic-bezier(.16,1,.3,1);
+}
+.drawer-overlay.open .drawer { transform: translateX(0); }
+.drawer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+.drawer-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.drawer-body {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+  padding: 12px 14px;
+  overflow: hidden;
+}
+
+/* 当前生效模型（Studio 设置行样式） */
+.active-model-box {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  flex-shrink: 0;
+}
+.active-model-label {
+  color: var(--text-muted); text-transform: uppercase;
+  letter-spacing: .5px; font-size: 11px; font-weight: 600;
+}
+.active-model-name {
+  font-family: var(--mono); font-size: 12px; color: var(--accent-primary);
+  margin-top: 4px; word-break: break-all;
+}
+.active-model-url {
+  font-family: var(--mono); font-size: 10px; color: var(--text-muted);
+  margin-top: 2px; word-break: break-all;
+}
+
+/* 模型列表（完全对齐 Studio .model-list / .model-group / .model-item） */
+.model-search { margin-bottom: 10px; flex-shrink: 0; }
+.model-search input {
+  width: 100%; background: var(--bg-input);
+  border: 1px solid var(--border-color); border-radius: 6px;
+  color: var(--text-primary); padding: 7px 10px; font-size: 13px;
+  font-family: inherit; outline: none; min-height: 34px;
+}
+.model-search input:focus { border-color: var(--accent-muted); }
+.model-list {
+  flex: 1; min-height: 120px;
+  overflow-y: auto; scrollbar-width: thin;
+  padding-bottom: 4px;
+}
+.model-group { margin-bottom: 4px; }
+.model-group-header {
+  color: var(--text-secondary); cursor: pointer; user-select: none;
+  border-radius: 6px; padding: 8px; font-size: 12px; font-weight: 600;
+  display: flex; align-items: center; gap: 6px;
+  transition: background-color .15s;
+}
+.model-group-header:hover { background-color: var(--bg-secondary); }
+.model-group-arrow { flex-shrink: 0; transition: transform .15s; font-size: 9px; }
+.model-group-arrow.collapsed { transform: rotate(-90deg); }
+.model-group-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-group-count { color: var(--text-muted); font-size: 11px; font-weight: 400; }
+.model-group-items { padding-inline-start: 8px; }
+.model-item {
+  color: var(--text-secondary); cursor: pointer; border-radius: 6px;
+  padding: 7px 10px; font-size: 13px;
+  display: flex; align-items: center; gap: 8px;
+  transition: all .15s;
+}
+.model-item:hover { background-color: rgba(var(--accent-primary-rgb), .06); color: var(--text-primary); }
+.model-item.active { color: var(--accent-primary); font-weight: 500; }
+.model-item-label { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.model-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 12px; }
+.model-check { color: var(--accent-primary); flex-shrink: 0; font-size: 12px; }
+
+/* 图标按钮 */
+.icon-btn {
+  width: 30px; height: 30px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: none; border-radius: 6px;
+  color: var(--text-muted); cursor: pointer;
+  font-size: 14px; transition: color .15s, background-color .15s;
+}
+.icon-btn:hover { background: var(--bg-secondary); color: var(--text-primary); }
+
+/* ===== 分段控制器（对齐 Studio .conversation-switch） ===== */
+.seg-switch {
+  display: grid; grid-template-columns: repeat(3, minmax(0,1fr));
+  gap: 2px; padding: 2px;
+  background: rgba(var(--accent-primary-rgb), .05);
+  border-radius: 6px;
+  margin: 14px 16px;
+}
+.seg-tab {
+  height: 30px; width: 100%; min-width: 0;
+  color: var(--text-secondary); background: none; border: none;
+  border-radius: 5px; cursor: pointer;
+  font-size: 13px; font-family: inherit;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: background-color .15s, color .15s;
+}
+.seg-tab:hover { color: var(--text-primary); }
+.seg-tab.active {
+  background: var(--bg-card-hover); color: var(--accent-primary);
+  box-shadow: inset 0 0 0 1px var(--border-color), 0 2px 5px rgba(0,0,0,.22);
+}
+
+/* ===== 内容区 ===== */
+.content { padding: 0 16px 32px; }
+.panel { display: none; }
+.panel.active { display: block; }
+.section { margin-bottom: 20px; }
+.section-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 8px;
+}
+.section-title {
+  color: var(--text-muted); text-transform: uppercase;
+  letter-spacing: .5px; font-size: 11px; font-weight: 600;
+}
+
+/* 设置行（对齐 Studio .setting-row） */
+.setting-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 0; border-bottom: 1px solid var(--border-light);
+}
+.setting-row:last-child { border-bottom: none; }
+.setting-info { flex: 1; margin-inline-end: 16px; min-width: 0; }
+.setting-label { color: var(--text-primary); font-size: 13px; display: block; }
+.setting-hint { color: var(--text-muted); margin-top: 2px; font-size: 12px; }
+.setting-control { flex-shrink: 0; }
+
+/* 卡片 */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 14px;
+}
+.card + .card { margin-top: 12px; }
+
+/* 徽章 */
+.badge {
+  display: inline-block; padding: 1px 6px; border-radius: 3px;
+  font-size: 10px; font-weight: 600; letter-spacing: .03em;
+}
+.badge-high { background: rgba(239,83,80,.15); color: var(--error); }
+.badge-medium { background: rgba(255,183,77,.15); color: var(--warning); }
+.badge-low { background: rgba(102,187,106,.15); color: var(--success); }
+.badge-info { background: rgba(107,163,214,.15); color: var(--accent-info); }
+.badge-critical { background: rgba(239,83,80,.25); color: #ff5252; border: 1px solid rgba(239,83,80,.5); font-weight: 700; }
+.badge-major { background: rgba(255,183,77,.2); color: #ffb74d; border: 1px solid rgba(255,183,77,.4); font-weight: 600; }
+.badge-routine { background: rgba(102,187,106,.2); color: #69f0ae; border: 1px solid rgba(102,187,106,.35); font-weight: 600; }
+
+/* 文本 */
+.txt-secondary { color: var(--text-secondary); }
+.txt-muted { color: var(--text-muted); }
+.txt-mono { font-family: var(--mono); }
+.fs-12 { font-size: 12px; }
+.fs-13 { font-size: 13px; }
+
+/* 按钮 */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  background: var(--bg-card-hover);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  border-radius: 6px; padding: 6px 12px;
+  font-size: 13px; font-family: inherit; cursor: pointer;
+  min-height: 32px;
+  transition: border-color .15s, background-color .15s;
+}
+.btn:hover { border-color: var(--accent-muted); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn-primary { background: var(--accent-primary); color: var(--text-on-accent); border-color: var(--accent-primary); font-weight: 500; }
+.btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn-ghost { background: none; border-color: transparent; color: var(--text-secondary); }
+.btn-ghost:hover { background: var(--bg-secondary); color: var(--text-primary); }
+.btn-sm { padding: 3px 8px; min-height: 26px; font-size: 12px; }
+
+/* 表格 */
+.tbl-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th {
+  text-align: left; color: var(--text-muted); font-weight: 600;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .4px;
+  padding: 8px 10px; border-bottom: 1px solid var(--border-color);
+}
+td { padding: 9px 10px; border-bottom: 1px solid var(--border-light); color: var(--text-secondary); }
+tr:last-child td { border-bottom: none; }
+
+/* 代码块 */
+.code-block {
+  background: var(--code-bg); border: 1px solid var(--border-color);
+  border-radius: 6px; padding: 10px 12px;
+  font-family: var(--mono); font-size: 12px; color: var(--accent-info);
+  word-break: break-all; line-height: 1.6;
+}
+
+/* 文本域 */
+textarea.field, input.field {
+  width: 100%; background: var(--bg-input);
+  border: 1px solid var(--border-color); border-radius: 6px;
+  color: var(--text-primary); padding: 8px 10px;
+  font-size: 13px; font-family: inherit; outline: none;
+}
+textarea.field { min-height: 220px; font-family: var(--mono); font-size: 12px; resize: vertical; }
+textarea.field:focus, input.field:focus { border-color: var(--accent-muted); }
+
+/* Toast */
+.toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  max-width: calc(100vw - 32px);
+  background: var(--bg-card); border: 1px solid var(--border-color);
+  color: var(--text-primary); border-radius: 8px;
+  padding: 10px 16px; font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  display: none; z-index: 999;
+}
+.toast.show { display: block; }
+
+/* 移动端适配 */
+@media (max-width: 768px) {
+  .setting-row { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .setting-info { margin-inline-end: 0; }
+  .setting-control { width: 100%; }
+  .model-trigger { min-height: 44px; }
+  .model-item { min-height: 44px; }
+  .model-group-header { min-height: 44px; }
+  .seg-tab { height: 40px; }
+  .btn { min-height: 44px; }
+  .drawer { width: 100%; max-width: 100vw; }
+  .model-trigger { min-width: 0; max-width: 150px; }
+  .drawer-head { padding: 10px 12px; }
+  .drawer-head .icon-btn { width: 44px; height: 44px; font-size: 16px; }
+  input.field, textarea.field { font-size: 16px; }
+  .model-search input { font-size: 16px; min-height: 44px; }
+}
+</style>
+</head>
+<body>
+
+<!-- 顶栏 -->
+<div class="topbar">
+  <div class="topbar-left">
+    <span class="topbar-title">WitP 战略推演看板</span>
+  </div>
+  <div class="topbar-right">
+    <button class="model-trigger" onclick="openDrawer()">
+      <span class="model-name" id="triggerModelName">加载中…</span>
+      <span class="model-arrow">▸</span>
+    </button>
+    <button class="icon-btn" id="syncBtn" onclick="syncState()" title="重读存档并刷新">↻</button>
+  </div>
+</div>
+
+<!-- 分段导航 -->
+<div class="seg-switch">
+  <button class="seg-tab active" onclick="switchTab('ops', this)">推演决策</button>
+  <button class="seg-tab" onclick="switchTab('skb', this)">知识库</button>
+  <button class="seg-tab" onclick="switchTab('history', this)">历史战果</button>
+</div>
+
+<div class="content">
+
+  <!-- 面板 1：推演决策 -->
+  <div id="panel-ops" class="panel active">
+    <!-- 方案时效与生成状态横幅（实时联动） -->
+    <div id="proposalAlertBanner" class="card" style="display:none;margin-bottom:12px;border-left:4px solid var(--warning);background:rgba(255,183,77,0.08);padding:10px 14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <div>
+          <span style="font-weight:600;font-size:13px;color:var(--warning)" id="proposalAlertTitle">⚠️ 方案时效提醒</span>
+          <div style="font-size:12px;color:var(--text-muted);margin-top:2px" id="proposalAlertDesc">正在检测方案时效…</div>
+        </div>
+        <button class="btn btn-sm" id="proposalAlertBtn" onclick="generateProposal()">立即更新</button>
+      </div>
+    </div>
+
+    <!-- 1. 当前对局与兵力现势 -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">当前对局与兵力现势</span>
+        <span class="txt-muted fs-11" id="turnStatusBadge">实时联动</span>
+      </div>
+      <div class="card">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(130px, 1fr));gap:12px;margin-bottom:12px;">
+          <div>
+            <div class="txt-muted fs-11" style="text-transform:uppercase">剧本名称</div>
+            <div class="txt-bold fs-13" id="infoScenario" style="margin-top:2px">—</div>
+          </div>
+          <div>
+            <div class="txt-muted fs-11" style="text-transform:uppercase">推演日期</div>
+            <div class="txt-mono fs-13" id="infoDate" style="margin-top:2px;color:var(--accent-info)">—</div>
+          </div>
+          <div>
+            <div class="txt-muted fs-11" style="text-transform:uppercase">推演回合</div>
+            <div class="txt-mono fs-13" id="infoTurn" style="margin-top:2px;color:var(--success)">—</div>
+          </div>
+          <div>
+            <div class="txt-muted fs-11" style="text-transform:uppercase">参谋大模型</div>
+            <div class="txt-mono fs-13" id="infoModelName" style="margin-top:2px;color:var(--text-primary)">—</div>
+          </div>
+          <div>
+            <div class="txt-muted fs-11" style="text-transform:uppercase">数据同步</div>
+            <div class="fs-12" id="infoFresh" style="margin-top:2px">—</div>
+          </div>
+        </div>
+
+        <!-- 航母与舰载机现势 -->
+        <div id="carrierStatusRow" style="padding-top:10px;border-top:1px solid var(--border-light);display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:12px;">
+          <span style="font-weight:600;color:var(--text-secondary)">主力航母群：</span>
+          <span id="carrierPosText" class="txt-mono" style="color:var(--text-primary)">—</span>
+          <span style="margin-inline-start:auto;color:var(--text-muted)">舰载机战备：<b style="color:var(--success)" id="fighterReadyCount">—</b> 架战斗机 (CAP) / <b style="color:var(--text-primary)" id="strikeReadyCount">—</b> 架攻击机</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. 战区威胁评估（分级聚类与中文化） -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">战区威胁评估</span>
+        <span class="txt-muted fs-11" id="threatCountHint">共 0 项侦测</span>
+      </div>
+      <div class="card" id="threatCard">
+        <div class="txt-muted fs-13">读取中…</div>
+      </div>
+    </div>
+
+    <!-- 3. 核心战略意图与海空搜索重点 -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">本回合战略意图</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="txt-muted fs-11" id="proposalGenTime">—</span>
+          <button class="btn btn-sm" onclick="generateProposal()">重新推演</button>
+        </div>
+      </div>
+      <div class="card">
+        <div>
+          <div style="font-weight:600;font-size:12px;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px">【作战指导与核心矛盾】</div>
+          <div class="fs-13" id="intentText" style="line-height:1.7;color:var(--text-primary)">—</div>
+        </div>
+
+        <div style="margin-top:14px;padding:10px 12px;background:rgba(107,163,214,0.08);border:1px solid rgba(107,163,214,0.25);border-radius:6px;">
+          <div style="font-weight:600;font-size:12px;color:var(--accent-info);display:flex;align-items:center;gap:6px">
+            <span>📡 海空搜索重点（侦察优先原则）</span>
+          </div>
+          <div class="fs-12" id="reconText" style="margin-top:6px;line-height:1.6;color:var(--text-secondary)">—</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 4. 推荐行动（按战术群分组） -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">推荐战术行动部署</span>
+        <div style="display:flex;gap:4px;background:var(--bg-input);padding:2px;border-radius:6px;border:1px solid var(--border-light)">
+          <button class="btn btn-sm btn-filter active" id="filterTab-ALL" style="height:24px;font-size:11px;padding:0 8px;border:none;background:var(--bg-card-hover);color:var(--text-primary)" onclick="filterActions('ALL', this)">全部</button>
+          <button class="btn btn-sm btn-filter" id="filterTab-CARRIER" style="height:24px;font-size:11px;padding:0 8px;border:none;background:none;color:var(--text-secondary)" onclick="filterActions('CARRIER', this)">航母群</button>
+          <button class="btn btn-sm btn-filter" id="filterTab-SURFACE" style="height:24px;font-size:11px;padding:0 8px;border:none;background:none;color:var(--text-secondary)" onclick="filterActions('SURFACE', this)">水面/潜艇</button>
+          <button class="btn btn-sm btn-filter" id="filterTab-AIR_CAP" style="height:24px;font-size:11px;padding:0 8px;border:none;background:none;color:var(--text-secondary)" onclick="filterActions('AIR_CAP', this)">防空制空</button>
+        </div>
+      </div>
+      <div class="card" style="padding:0">
+        <div class="tbl-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:20%">目标部队</th>
+                <th style="width:14%">动作</th>
+                <th style="width:16%">部署参数</th>
+                <th>战术理由</th>
+                <th style="width:12%">优先级</th>
+              </tr>
+            </thead>
+            <tbody id="actionsBody">
+              <tr><td colspan="5" class="txt-muted" style="text-align:center;padding:20px">载入中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 5. 前线执行指令台 -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">前线执行指令台</span>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-sm" onclick="copyCmdPart('tf')">复制航线指令</button>
+          <button class="btn btn-sm" onclick="copyCmdPart('air')">复制防空指令</button>
+          <button class="btn btn-sm" onclick="copyCmdAll()">复制全部指令</button>
+        </div>
+      </div>
+      <div class="code-block" id="cmdBlock" style="white-space:pre-wrap;word-break:break-all;">witp-cmd staff</div>
+    </div>
+  </div>
+
+  <!-- 面板 2：知识库 -->
+  <div id="panel-skb" class="panel">
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">实战教条</span>
+        <button class="btn btn-sm" onclick="saveDoctrines()">提交</button>
+      </div>
+      <textarea class="field" id="doctrinesField"></textarea>
+    </div>
+    <div class="section">
+      <div class="section-head"><span class="section-title">战术模式</span></div>
+      <div id="patternsList" class="txt-muted fs-13">载入中…</div>
+    </div>
+  </div>
+
+  <!-- 面板 3：历史战果 -->
+  <div id="panel-history" class="panel">
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">对局得分对比</span>
+        <button class="btn btn-sm" onclick="copyScores()">复制</button>
+      </div>
+      <div class="card" style="padding:0">
+        <div class="tbl-wrap">
+          <table id="scoresTable">
+            <thead>
+              <tr><th>对局</th><th>剧本</th><th>终局</th><th>敌方</th><th>我方</th><th>胜负</th><th>因果</th></tr>
+            </thead>
+            <tbody id="resultsBody">
+              <tr><td colspan="5" class="txt-muted" style="text-align:center;padding:20px">载入战果台账…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">回合因果记录</span>
+        <button class="btn btn-sm" onclick="loadCausalLogs()">刷新</button>
+      </div>
+      <div id="causalList" class="txt-muted fs-13">载入中…</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- 拉出式侧边栏：参谋大模型与接入点配置 -->
+<div class="drawer-overlay" id="drawerOverlay" onclick="if(event.target===this)closeDrawer()">
+  <aside class="drawer" style="width:440px">
+    <div class="drawer-head">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="drawer-title">参谋大模型与接入点配置</span>
+      </div>
+      <button class="icon-btn" onclick="closeDrawer()" title="关闭">✕</button>
+    </div>
+    <div class="drawer-body">
+      <!-- 1. 当前主备状态卡片 -->
+      <div class="active-model-box" style="margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+          <div class="active-model-label">当前主模型 (PRIMARY)</div>
+          <span class="txt-mono fs-11" id="drawerPrimaryLatency" style="color:var(--text-muted)"></span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <div class="active-model-name" id="drawerActiveModel" style="font-size:13px;font-weight:600">—</div>
+          <span class="badge badge-info fs-11" id="drawerActiveProvider">—</span>
+        </div>
+        <div class="active-model-url" id="drawerActiveUrl"></div>
+
+        <!-- 备用回退链 (Fallbacks) 列表 -->
+        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border-subtle)">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <span class="active-model-label">备用回退链 (FALLBACKS)</span>
+            <button class="btn btn-sm" style="padding:1px 6px;font-size:10px" onclick="clearFallbacksFromDrawer()" title="清空全部备用">清空</button>
+          </div>
+          <div id="drawerFallbacksContainer" style="display:flex;flex-direction:column;gap:4px">
+            <span class="txt-muted fs-11">无备用模型（点击下方列表中「+备用」添加）</span>
+          </div>
+        </div>
+
+        <div style="margin-top:10px;display:flex;gap:6px">
+          <button class="btn btn-sm" style="flex:1" onclick="testCurrentModelsSpeed(this)">⚡ 测速当前主备</button>
+          <button class="btn btn-sm btn-primary" style="flex:1" onclick="saveModelsFromDrawer()">💾 保存配置生效</button>
+        </div>
+        <div id="drawerSaveFeedback" class="setting-hint" style="margin-top:4px;text-align:center"></div>
+      </div>
+
+      <!-- 2. 搜索框 -->
+      <div class="model-search" style="margin-bottom:8px">
+        <input type="text" id="modelSearchInput" placeholder="搜索模型名称（如 gemini, step, claude）…" oninput="filterModels(this.value)">
+      </div>
+
+      <!-- 3. 模型列表区 (按接入点分组) -->
+      <div class="model-list" id="modelList" style="flex:1"></div>
+
+      <!-- 4. 底部快捷操作 -->
+      <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border-subtle);display:flex;gap:8px;flex-shrink:0">
+        <button class="btn btn-sm" style="flex:1" onclick="fetchModels('all')">↻ 一键拉取所有接入点模型</button>
+        <button class="btn btn-sm" style="flex:1" onclick="loadModelsConfig()">刷新状态</button>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+function apiBase() {
+  if (location.hostname.includes("swanwick.site")) return "https://witp-agent.swanwick.site/api/plugins/witp-dashboard";
+  if (location.port === "18091") return "/api/plugins/witp-dashboard";
+  return "https://witp-agent.swanwick.site/api/plugins/witp-dashboard";
+}
+const API = apiBase();
+
+let providers = [];
+let activeProviderId = null;
+let activeModel = "";
+let expandedGroups = {};
+
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+function switchTab(id, el) {
+  document.querySelectorAll(".seg-tab").forEach(b => b.classList.remove("active"));
+  el.classList.add("active");
+  document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+  document.getElementById("panel-" + id).classList.add("active");
+  if (id === "skb") loadSKB();
+  if (id === "history") { loadResults(); loadCausalLogs(); }
+}
+
+function openDrawer() {
+  document.getElementById("drawerOverlay").classList.add("open");
+  setTimeout(() => { const el = document.getElementById("modelSearchInput"); if (el) el.focus(); }, 220);
+}
+function closeDrawer() {
+  document.getElementById("drawerOverlay").classList.remove("open");
+}
+async function testModel() {
+  const fb = document.getElementById("drawerFeedback");
+  fb.textContent = "探测中…";
+  try {
+    const r = await fetch(API + "/config/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const d = await r.json();
+    fb.textContent = d.ok ? ("连通正常 · " + d.latency_ms + " ms") : ("连通失败：" + (d.error || "未知错误"));
+  } catch (e) { fb.textContent = "请求失败"; }
+}
+
+function refreshAll() {
+  loadStatus();
+  loadProposal();
+  loadProviders();
+  toast("已刷新");
+}
+
+function fmtAge(sec) {
+  if (sec == null) return "—";
+  if (sec < 60) return Math.round(sec) + " 秒前";
+  if (sec < 3600) return Math.round(sec / 60) + " 分钟前";
+  return Math.round(sec / 3600) + " 小时前";
+}
+
+function renderFreshness(f) {
+  const el = document.getElementById("infoFresh");
+  const hint = document.getElementById("infoFreshHint");
+  if (!f || f.snapshot_age_s == null) {
+    el.textContent = "—";
+    hint.textContent = "尚未同步";
+    return;
+  }
+  const age = f.snapshot_age_s;
+  const stale = f.staleness_s;
+  const color = (stale != null && stale > 120) ? "var(--warning)" : "var(--success)";
+  el.innerHTML = '<span style="color:' + color + '">' + fmtAge(age) + '</span>';
+  const parts = [];
+  if (stale != null) parts.push(stale > 120 ? "落后存档 " + Math.round(stale) + "s" : "与存档同步");
+  if (f.watcher_heartbeat_at) parts.push("监听器在线");
+  else parts.push("监听器未运行");
+  hint.textContent = parts.join(" · ");
+}
+
+async function syncState() {
+  const btn = document.getElementById("syncBtn");
+  btn.disabled = true;
+  btn.textContent = "⋯";
+  toast("正在重读存档…");
+  try {
+    const r = await fetch(API + "/refresh-state", { method: "POST" });
+    const d = await r.json();
+    if (d.ok) {
+      toast("已同步 · " + (d.scenario || "") + " " + (d.date || ""));
+      loadStatus();
+      loadProposal();
+    } else {
+      toast("同步失败：" + (d.error || "未知错误"));
+    }
+  } catch (e) {
+    toast("请求失败");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "↻";
+  }
+}
+
+/* ===== 全局推演状态 ===== */
+let latestTurnNum = null;
+let currentProposalData = null;
+let currentActionFilter = "ALL";
+
+/* ===== 状态 ===== */
+async function loadStatus() {
+  try {
+    const r = await fetch(API + "/status");
+    if (!r.ok) return;
+    const s = await r.json();
+    const t = s.turn || {};
+    latestTurnNum = t.turn || 1;
+    document.getElementById("infoScenario").textContent = t.scenario || "珊瑚海战役";
+    document.getElementById("infoDate").textContent = t.date || "—";
+    document.getElementById("infoTurn").textContent = "第 " + latestTurnNum + " 回合";
+    
+    // 参谋大模型展示（从当前配置或抽屉触发器获取）
+    const strat = (currentConfig && currentConfig.strategy_model) || {};
+    const mName = strat.model || (document.getElementById("triggerModelName") ? document.getElementById("triggerModelName").textContent.replace(" ▸", "") : "glm-5.3-flash");
+    const mEl = document.getElementById("infoModelName");
+    if (mEl) mEl.textContent = mName;
+
+    renderFreshness(s.freshness || {});
+    checkProposalFreshness();
+  } catch (e) {}
+}
+
+function checkProposalFreshness() {
+  const banner = document.getElementById("proposalAlertBanner");
+  if (!banner) return;
+  if (!currentProposalData) {
+    banner.style.display = "none";
+    return;
+  }
+  const propTurn = currentProposalData.turn;
+  if (latestTurnNum != null && propTurn != null && propTurn < latestTurnNum) {
+    banner.style.display = "block";
+    document.getElementById("proposalAlertTitle").textContent = "⚠️ 当前展示为上一回合方案";
+    document.getElementById("proposalAlertDesc").textContent = 
+      `游戏已推进至第 ${latestTurnNum} 回合，当前展示方案归属于第 ${propTurn} 回合。参谋部正在推演新方案或可点击右侧立即更新。`;
+    const btn = document.getElementById("proposalAlertBtn");
+    if (btn) btn.textContent = `生成第 ${latestTurnNum} 回合方案`;
+  } else {
+    banner.style.display = "none";
+  }
+}
+
+/* ===== 推演决策 ===== */
+async function loadProposal() {
+  try {
+    const r = await fetch(API + "/proposal/latest");
+    if (r.ok) {
+      const d = await r.json();
+      if (d.ok && d.proposal) {
+        currentProposalData = d.proposal;
+        renderProposal(d.proposal);
+        checkProposalFreshness();
+        return;
+      }
+    }
+  } catch (e) {}
+
+  try {
+    const r2 = await fetch(API + "/causal-logs");
+    if (r2.ok) {
+      const d2 = await r2.json();
+      const logs = d2.logs || [];
+      if (logs.length) {
+        currentProposalData = logs[logs.length - 1];
+        renderProposal(currentProposalData);
+        checkProposalFreshness();
+        return;
+      }
+    }
+  } catch (e) {}
+
+  renderEmpty();
+}
+
+function renderProposal(data) {
+  if (!data) return renderEmpty();
+  currentProposalData = data;
+
+  // 1. 意图与时间
+  const intentText = data.strategic_intent ||
+                     (data.D_decision && (data.D_decision.intent && (data.D_decision.intent.rationale || data.D_decision.intent.strategic_intent) || data.D_decision.decision)) ||
+                     "无战略意图记录。";
+  document.getElementById("intentText").innerHTML = formatIntentText(intentText);
+
+  const reconText = data.recon_guidance ||
+                    (data.D_decision && data.D_decision.intent && (data.D_decision.intent.recon_priority || data.D_decision.intent.recon_focus)) ||
+                    "保持全空域扇面海空侦察，严防敌航母打击群与突击船团。";
+  document.getElementById("reconText").textContent = reconText;
+
+  const timeEl = document.getElementById("proposalGenTime");
+  if (timeEl) {
+    timeEl.textContent = data.generated_at ? `推演于 ${data.generated_at.split(" ")[1] || data.generated_at}` : "实时";
+  }
+
+  if (data.active_model_used) {
+    const mEl = document.getElementById("infoModelName");
+    if (mEl) mEl.textContent = data.active_model_used;
+  }
+
+  // 2. 我方兵力现势
+  if (data.friendly_forces) {
+    const ff = data.friendly_forces;
+    const cvs = ff.carriers || [];
+    if (cvs.length) {
+      const cvText = cvs.map(c => `${c.flagship || c.tf_id} (${c.pos ? c.pos.join(",") : "?"})`).join(" · ");
+      const cPosEl = document.getElementById("carrierPosText");
+      if (cPosEl) cPosEl.textContent = cvText;
+    }
+    const fCnt = document.getElementById("fighterReadyCount");
+    const sCnt = document.getElementById("strikeReadyCount");
+    if (fCnt && ff.fighters_ready != null) fCnt.textContent = ff.fighters_ready;
+    if (sCnt && ff.strike_ready != null) sCnt.textContent = ff.strike_ready;
+  }
+
+  // 3. 威胁研判
+  const regions = (data.situation_summary && data.situation_summary.threat_regions) ||
+                  (data.S_situation && data.S_situation.belief && data.S_situation.belief.regions) ||
+                  {};
+  renderThreats(regions);
+
+  // 4. 推荐行动
+  renderActionTable();
+  renderCommandBlocks();
+}
+
+function formatIntentText(raw) {
+  if (!raw) return "—";
+  if (raw.includes("①") || raw.includes("②") || raw.includes("1.") || raw.includes("2.")) {
+    const parts = raw.split(/(?=[①②③④⑤⑥⑦⑧⑨]|\b[1-9]\.\s*)/);
+    const main = parts[0].trim();
+    const bullets = parts.slice(1).map(p => {
+      const idx = p.match(/^[①②③④⑤⑥⑦⑧⑨]|[1-9]\./);
+      const symbol = idx ? idx[0] : "•";
+      const content = p.replace(/^[①②③④⑤⑥⑦⑧⑨]|[1-9]\.\s*/, "").trim();
+      return `<div style="display:flex;align-items:flex-start;gap:8px;margin-top:6px;background:rgba(255,255,255,0.02);padding:5px 8px;border-radius:4px;">
+        <span style="color:var(--accent-info);font-weight:700;font-size:13px;line-height:1.4">${symbol}</span>
+        <span style="flex:1;line-height:1.55;color:var(--text-secondary)">${content}</span>
+      </div>`;
+    }).join("");
+    return (main ? `<div style="margin-bottom:8px;font-weight:500;line-height:1.6">${main}</div>` : "") + bullets;
+  }
+  return raw;
+}
+
+function filterActions(group, el) {
+  currentActionFilter = group;
+  document.querySelectorAll(".btn-filter").forEach(b => {
+    b.style.background = "none";
+    b.style.color = "var(--text-secondary)";
+    b.classList.remove("active");
+  });
+  if (el) {
+    el.style.background = "var(--bg-card-hover)";
+    el.style.color = "var(--text-primary)";
+    el.classList.add("active");
+  }
+  renderActionTable();
+}
+
+function renderActionTable() {
+  const data = currentProposalData;
+  if (!data) return;
+  const rawActions = data.recommended_actions ||
+                     (data.D_decision && data.D_decision.orders) ||
+                     [];
+  
+  // 严格过滤：轰炸机绝不出现 CAP 0%
+  const validActions = rawActions.filter(a => {
+    if (typeof a === "string") return true;
+    const act = (a.action || a.type || "").toUpperCase();
+    const tid = (a.target_id || "").toUpperCase();
+    if (act.includes("CAP") && (tid.startsWith("VB") || tid.startsWith("VS") || tid.startsWith("VT") || (a.params && a.params.cap_pct === 0))) {
+      return false;
+    }
+    return true;
+  });
+
+  const filtered = validActions.filter(a => {
+    if (currentActionFilter === "ALL") return true;
+    if (typeof a === "string") return true;
+    const grp = a.tactical_group || "";
+    const tid = (a.target_id || "").toUpperCase();
+    const act = (a.action || a.type || "").toUpperCase();
+    if (currentActionFilter === "CARRIER") {
+      return grp === "CARRIER" || tid.includes("TF14") || tid.includes("TF16");
+    }
+    if (currentActionFilter === "SURFACE") {
+      return grp === "SURFACE" || grp === "LOGISTICS" || grp === "SUBMARINE" || (!tid.includes("TF14") && !tid.includes("TF16") && !act.includes("CAP"));
+    }
+    if (currentActionFilter === "AIR_CAP") {
+      return grp === "AIR_CAP" || act.includes("CAP");
+    }
+    return true;
+  });
+
+  const tb = document.getElementById("actionsBody");
+  if (!filtered.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="txt-muted" style="text-align:center;padding:16px">当前分类无推荐行动</td></tr>';
+    return;
+  }
+
+  tb.innerHTML = filtered.map(a => {
+    if (typeof a === "string") {
+      return `<tr><td colspan="5" class="txt-mono fs-12">${a}</td></tr>`;
+    }
+    const unitName = a.unit_name || a.target_id || "—";
+    const actLabel = a.action_label || (a.action === "SET_DESTINATION" ? "机动集结" : (a.action === "SET_CAP_PERCENT" ? "防空巡逻" : a.action));
+    let paramStr = a.param_label;
+    if (!paramStr) {
+      if (a.params && a.params.hex) paramStr = `海域 (${a.params.hex.join(",")})`;
+      else if (a.params && a.params.cap_pct != null) paramStr = `CAP ${a.params.cap_pct}%`;
+      else paramStr = "—";
+    }
+
+    const rationale = a.rationale || "按教条执行战役机动";
+    const pLabel = a.priority_label || (a.confidence && a.confidence >= 0.9 ? "战术协同" : "核心部署");
+    const pCls = (pLabel.includes("避险") || pLabel.includes("突击")) ? "badge-high" : (pLabel.includes("防空") ? "badge-low" : "badge-info");
+
+    return `<tr>
+      <td class="txt-mono fs-12" style="font-weight:600;color:var(--text-primary)">${unitName}</td>
+      <td class="fs-12">${actLabel}</td>
+      <td class="txt-mono fs-12" style="color:var(--accent-info)">${paramStr}</td>
+      <td class="fs-12" style="line-height:1.5">${rationale}</td>
+      <td><span class="badge ${pCls}">${pLabel}</span></td>
+    </tr>`;
+  }).join("");
+}
+
+function renderCommandBlocks() {
+  const data = currentProposalData;
+  if (!data) return;
+  const rawActions = data.recommended_actions || [];
+
+  const tfCmds = [];
+  const airCmds = [];
+
+  for (const a of rawActions) {
+    if (typeof a === "string") continue;
+    const tid = a.target_id;
+    if (!tid) continue;
+    const act = (a.action || a.type || "").toUpperCase();
+    if (act.includes("DEST") && a.params && a.params.hex) {
+      tfCmds.push(`witp-cmd set-dest ${tid} ${a.params.hex[0]} ${a.params.hex[1]}`);
+    } else if (act.includes("CAP") && a.params && a.params.cap_pct != null) {
+      if (a.params.cap_pct > 0 && !tid.toUpperCase().startsWith("VB") && !tid.toUpperCase().startsWith("VS") && !tid.toUpperCase().startsWith("VT")) {
+        airCmds.push(`witp-cmd set-cap ${tid} ${a.params.cap_pct}`);
+      }
+    }
+  }
+
+  const all = [...tfCmds, ...airCmds, "witp-cmd end-turn"].join(" && ");
+  document.getElementById("cmdBlock").textContent = all || "witp-cmd staff";
+  window._lastTfCmds = tfCmds.join(" && ");
+  window._lastAirCmds = airCmds.join(" && ");
+  window._lastAllCmds = all;
+}
+
+function copyCmdPart(part) {
+  let txt = "";
+  if (part === "tf") txt = window._lastTfCmds || "";
+  else if (part === "air") txt = window._lastAirCmds || "";
+  if (!txt) {
+    toast("该分类无待执行指令");
+    return;
+  }
+  navigator.clipboard.writeText(txt).then(() => toast("✓ 航线指令已复制"));
+}
+
+function copyCmdAll() {
+  const txt = window._lastAllCmds || document.getElementById("cmdBlock").textContent;
+  navigator.clipboard.writeText(txt).then(() => toast("✓ 全部执行指令已复制"));
+}
+
+function renderEmpty() {
+  document.getElementById("intentText").textContent =
+    "暂无推演记录。参谋部正自动读取最新对局存档并出具方案。";
+  document.getElementById("reconText").textContent = "—";
+  document.getElementById("actionsBody").innerHTML =
+    '<tr><td colspan="5" class="txt-muted" style="text-align:center;padding:20px">等待推演</td></tr>';
+  document.getElementById("cmdBlock").textContent = "witp-cmd staff";
+  renderThreats({});
+}
+
+function renderThreats(regions) {
+  const keys = Object.keys(regions);
+  const box = document.getElementById("threatCard");
+  const countHint = document.getElementById("threatCountHint");
+  if (!keys.length) {
+    box.innerHTML = '<div class="txt-muted fs-13">暂无战区威胁侦测</div>';
+    if (countHint) countHint.textContent = "共 0 项侦测";
+    return;
+  }
+  if (countHint) countHint.textContent = `共 ${keys.length} 项侦测接触`;
+
+  // 按危害程度排序：HIGH -> MEDIUM -> LOW
+  const sortedKeys = [...keys].sort((a, b) => {
+    const la = regions[a].level || "LOW";
+    const lb = regions[b].level || "LOW";
+    const scoreMap = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+    return (scoreMap[lb] || 0) - (scoreMap[la] || 0);
+  });
+
+  box.innerHTML = sortedKeys.map(k => {
+    const r = regions[k];
+    const lv = r.level || "LOW";
+    const cls = lv === "HIGH" ? "badge-critical" : lv === "MEDIUM" ? "badge-major" : "badge-routine";
+    const label = lv === "HIGH" ? "即刻危机" : lv === "MEDIUM" ? "重点监控" : "常规警戒";
+    return `<div class="setting-row" style="padding:8px 0;border-bottom:1px solid var(--border-light)">
+      <div class="setting-info" style="flex:1">
+        <div style="display:flex;align-items:center;gap:6px">
+          <span class="setting-label" style="font-weight:600;color:var(--text-primary)">${r.name || k}</span>
+        </div>
+        <div class="setting-hint" style="margin-top:3px;line-height:1.5;color:var(--text-secondary)">${r.detail || "常规海空监测中"}</div>
+      </div>
+      <div class="setting-control" style="margin-inline-start:12px"><span class="badge ${cls}">${label}</span></div>
+    </div>`;
+  }).join("");
+}
+
+async function generateProposal() {
+  toast("正在调用参谋部大模型生成方案…");
+  try {
+    const r = await fetch(API + "/proposal/generate", { method: "POST" });
+    const d = await r.json();
+    if (d.ok && d.proposal) {
+      toast("✓ 作战方案建议书已更新！");
+      renderProposal(d.proposal);
+      loadStatus();
+    } else {
+      toast("生成失败：" + (d.error || "未知错误"));
+    }
+  } catch (e) {
+    toast("请求异常");
+  }
+}
+
+function copyCmd() {
+  copyCmdAll();
+}
+
+/* ===== 参谋模型与接入点管理 (抽屉Drawer中统一交互) ===== */
+let modelsConfig = { primary: {}, fallbacks: [], providers_pool: [] };
+
+async function loadProviders() {
+  await loadModelsConfig();
+}
+
+async function loadModelsConfig() {
+  try {
+    const r = await fetch(API + "/models");
+    if (!r.ok) return;
+    modelsConfig = await r.json();
+    providers = modelsConfig.providers_pool || [];
+    renderDrawerModelsHeader();
+    renderModelList(document.getElementById("modelSearchInput") ? document.getElementById("modelSearchInput").value : "");
+  } catch (e) {
+    console.error("加载模型配置失败", e);
+  }
+}
+
+function renderDrawerModelsHeader() {
+  const prim = modelsConfig.primary || {};
+  const fbs = modelsConfig.fallbacks || [];
+
+  const dAct = document.getElementById("drawerActiveModel");
+  const dProv = document.getElementById("drawerActiveProvider");
+  const dUrl = document.getElementById("drawerActiveUrl");
+  const trig = document.getElementById("triggerModelName");
+
+  if (dAct) dAct.textContent = prim.model || "未设置";
+  if (dProv) dProv.textContent = prim.provider_id || "未知";
+  if (dUrl) dUrl.textContent = prim.base_url || "";
+  if (trig && prim.model) trig.textContent = prim.model;
+
+  const fbBox = document.getElementById("drawerFallbacksContainer");
+  if (fbBox) {
+    if (!fbs.length) {
+      fbBox.innerHTML = '<span class="txt-muted fs-11">无备用模型（点击下方列表中「+备用」添加）</span>';
+    } else {
+      fbBox.innerHTML = fbs.map((f, idx) => `
+        <div style="display:flex;justify-content:space-between;align-items:center;background:var(--bg-secondary);padding:3px 8px;border-radius:4px;border:1px solid var(--border-subtle)">
+          <div style="display:flex;gap:6px;align-items:center;min-width:0">
+            <span class="badge badge-info fs-10" style="padding:1px 4px">#${idx + 1} 备用</span>
+            <span class="txt-mono fs-11" style="color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${f.model}</span>
+          </div>
+          <div style="display:flex;gap:4px;align-items:center;flex-shrink:0">
+            <span class="txt-mono fs-10" id="fbLatency_${idx}" style="color:var(--text-muted)"></span>
+            <button class="icon-btn" style="width:20px;height:20px;font-size:11px" onclick="removeFallbackFromDrawer('${f.model.replace(/'/g, "\\'")}')" title="移除此备用">✕</button>
+          </div>
+        </div>
+      `).join("");
+    }
+  }
+}
+
+function renderModelList(filter) {
+  const box = document.getElementById("modelList");
+  if (!box) return;
+  const f = (filter || "").toLowerCase();
+  let html = "";
+
+  const primModel = (modelsConfig.primary && modelsConfig.primary.model) || "";
+  const fbs = modelsConfig.fallbacks || [];
+  const pool = providers;
+
+  pool.forEach(p => {
+    const models = (p.models || []).filter(m => !f || m.toLowerCase().includes(f));
+    if (f && !models.length) return;
+    const isExpanded = expandedGroups[p.id] !== false;
+
+    html += `<div class="model-group">
+      <div class="model-group-header" onclick="toggleGroup('${p.id}')">
+        <span class="model-group-arrow ${isExpanded ? "" : "collapsed"}">▾</span>
+        <span class="model-group-label">${p.name || p.id}</span>
+        <span class="model-group-count" style="margin-right:6px">${(p.models || []).length}</span>
+        <button class="btn btn-sm" style="padding:1px 6px;font-size:10px;margin-left:auto" onclick="event.stopPropagation(); fetchModels('${p.id}')" title="拉取更新此接入点模型">↻ 拉取</button>
+      </div>`;
+
+    if (isExpanded) {
+      html += '<div class="model-group-items">';
+      if (!models.length) {
+        html += `<div class="model-item" onclick="fetchModels('${p.id}')" style="color:var(--accent-info);cursor:pointer;padding:6px 8px">
+          <span class="model-item-label"><span class="model-item-name">拉取模型列表…</span></span></div>`;
+      } else {
+        models.forEach(m => {
+          const isPrimary = (m === primModel);
+          const fbIdx = fbs.findIndex(fb => fb.model === m);
+
+          html += `<div class="model-item ${isPrimary ? "active" : ""}" style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px">
+            <div class="model-item-label" style="flex:1;min-width:0">
+              <span class="model-item-name" style="font-size:12px;font-family:var(--mono)" title="${m}">${m}</span>
+              <span class="txt-muted fs-10">${p.id}</span>
+            </div>
+            <div style="display:flex;gap:4px;align-items:center;flex-shrink:0">
+              ${isPrimary 
+                ? '<span class="badge badge-success fs-11" style="cursor:default">★ 主模型</span>' 
+                : `<button class="btn btn-sm" style="padding:2px 7px;font-size:11px" onclick="setPrimaryFromDrawer('${p.id}','${m.replace(/'/g, "\\'")}')">设为主模型</button>`
+              }
+              ${fbIdx >= 0 
+                ? `<button class="btn btn-sm" style="padding:2px 7px;font-size:11px;background:var(--accent-muted);border-color:var(--accent-primary);color:var(--text-primary)" onclick="removeFallbackFromDrawer('${m.replace(/'/g, "\\'")}')" title="点击移除备用">#${fbIdx+1} 备用 ✕</button>` 
+                : `<button class="btn btn-sm" style="padding:2px 7px;font-size:11px" onclick="addFallbackFromDrawer('${p.id}','${m.replace(/'/g, "\\'")}')">+备用</button>`
+              }
+            </div>
+          </div>`;
+        });
+      }
+      html += "</div>";
+    }
+    html += "</div>";
+  });
+
+  box.innerHTML = html || '<div class="txt-muted fs-13" style="padding:12px">无匹配模型</div>';
+}
+
+function setPrimaryFromDrawer(pid, model) {
+  if (!modelsConfig.primary) modelsConfig.primary = {};
+  modelsConfig.primary.model = model;
+  modelsConfig.primary.provider_id = pid;
+
+  // 从备用链中移除该模型，避免主备重复
+  if (modelsConfig.fallbacks) {
+    modelsConfig.fallbacks = modelsConfig.fallbacks.filter(f => f.model !== model);
+  }
+
+  renderDrawerModelsHeader();
+  renderModelList(document.getElementById("modelSearchInput") ? document.getElementById("modelSearchInput").value : "");
+  toast("已选为主模型: " + model + "（请点击「保存配置生效」）");
+}
+
+function addFallbackFromDrawer(pid, model) {
+  if (!modelsConfig.primary) modelsConfig.primary = {};
+  if (modelsConfig.primary.model === model) {
+    toast("该模型已被选为主模型！");
+    return;
+  }
+  if (!modelsConfig.fallbacks) modelsConfig.fallbacks = [];
+  if (modelsConfig.fallbacks.some(f => f.model === model)) {
+    toast("该模型已在备用链中！");
+    return;
+  }
+  if (modelsConfig.fallbacks.length >= 4) {
+    toast("备用链最多添加 4 个模型！");
+    return;
+  }
+  modelsConfig.fallbacks.push({ model: model, provider_id: pid });
+  renderDrawerModelsHeader();
+  renderModelList(document.getElementById("modelSearchInput") ? document.getElementById("modelSearchInput").value : "");
+  toast("已加入备用链: " + model);
+}
+
+function removeFallbackFromDrawer(model) {
+  if (modelsConfig.fallbacks) {
+    modelsConfig.fallbacks = modelsConfig.fallbacks.filter(f => f.model !== model);
+  }
+  renderDrawerModelsHeader();
+  renderModelList(document.getElementById("modelSearchInput") ? document.getElementById("modelSearchInput").value : "");
+  toast("已从备用链移除: " + model);
+}
+
+function clearFallbacksFromDrawer() {
+  modelsConfig.fallbacks = [];
+  renderDrawerModelsHeader();
+  renderModelList(document.getElementById("modelSearchInput") ? document.getElementById("modelSearchInput").value : "");
+  toast("已清空备用链");
+}
+
+async function saveModelsFromDrawer() {
+  const fbBox = document.getElementById("drawerSaveFeedback");
+  const prim = modelsConfig.primary || {};
+  if (!prim.model) {
+    toast("请选择主模型！");
+    return;
+  }
+  if (fbBox) fbBox.textContent = "正在保存配置…";
+
+  const fbNames = (modelsConfig.fallbacks || []).map(f => f.model);
+  try {
+    const r = await fetch(API + "/models/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        primary: prim.model,
+        primary_provider: prim.provider_id,
+        fallbacks: fbNames
+      })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      toast("✓ 参谋模型与备用链已保存生效！");
+      if (fbBox) fbBox.innerHTML = '<span style="color:var(--success)">✓ 配置已保存至 config.yaml 并立即生效</span>';
+      loadModelsConfig();
+    } else {
+      toast("保存失败：" + (d.error || "未知错误"));
+      if (fbBox) fbBox.innerHTML = '<span style="color:var(--error)">保存失败：' + (d.error || "未知错误") + '</span>';
+    }
+  } catch (e) {
+    toast("请求异常");
+    if (fbBox) fbBox.textContent = "请求异常";
+  }
+}
+
+async function testCurrentModelsSpeed(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "探测中…"; }
+  toast("正在测速当前主模型与备用链…");
+  try {
+    const r = await fetch(API + "/models/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    const d = await r.json();
+    if (d.ok) {
+      const res = d.results || [];
+      res.forEach(item => {
+        if (item.role === "primary") {
+          const el = document.getElementById("drawerPrimaryLatency");
+          if (el) el.innerHTML = item.ok ? `<span style="color:var(--success)">(${item.latency_s}s)</span>` : `<span style="color:var(--error)">(异常)</span>`;
+        } else if (item.role && item.role.startsWith("fallback_")) {
+          const idx = parseInt(item.role.replace("fallback_", "")) - 1;
+          const el = document.getElementById("fbLatency_" + idx);
+          if (el) el.innerHTML = item.ok ? `<span style="color:var(--success)">(${item.latency_s}s)</span>` : `<span style="color:var(--error)">(异常)</span>`;
+        }
+      });
+      toast("测速完成");
+    }
+  } catch (e) {
+    toast("测速失败");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "⚡ 测速当前主备"; }
+  }
+}
+
+function toggleGroup(id) {
+  expandedGroups[id] = expandedGroups[id] === false ? true : false;
+  renderModelList(document.getElementById("modelSearchInput").value);
+}
+
+function filterModels(v) { renderModelList(v); }
+
+async function fetchModels(pid) {
+  const isAll = (pid === 'all' || !pid);
+  toast(isAll ? "正在拉取全部接入点模型…" : `正在拉取 ${pid} 模型…`);
+  try {
+    const r = await fetch(API + "/providers/fetch-models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider_id: isAll ? "all" : pid })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      toast("已获取 " + (d.total_models || d.count || 0) + " 个可用模型！");
+      await loadModelsConfig();
+    } else {
+      toast("拉取失败：" + (d.error || "未知错误"));
+    }
+  } catch (e) { toast("请求异常"); }
+}
+
+/* ===== 知识库 ===== */
+async function loadSKB() {
+  try {
+    const r = await fetch(API + "/skb");
+    if (!r.ok) return;
+    const d = await r.json();
+    document.getElementById("doctrinesField").value = d.doctrines || "";
+    const ps = d.patterns || [];
+    document.getElementById("patternsList").innerHTML = ps.length
+      ? ps.map(p => `<div class="card" style="margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+            <span class="fs-13" style="color:var(--text-primary)">${p.trigger}</span>
+            <span class="badge badge-info">${p.confidence}</span>
+          </div>
+          <div class="setting-hint" style="margin-top:6px">${p.response}</div>
+        </div>`).join("")
+      : '<div class="txt-muted fs-13">暂无战术模式</div>';
+  } catch (e) {}
+}
+
+async function saveDoctrines() {
+  try {
+    const r = await fetch(API + "/skb/doctrine", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: document.getElementById("doctrinesField").value })
+    });
+    const d = await r.json();
+    toast(d.ok ? "已提交至知识库" : "保存失败");
+  } catch (e) { toast("请求失败"); }
+}
+
+/* ===== 历史 ===== */
+async function loadCausalLogs() {
+  const box = document.getElementById("causalList");
+  try {
+    const r = await fetch(API + "/causal-logs");
+    if (!r.ok) return;
+    const d = await r.json();
+    const logs = d.logs || [];
+    if (!logs.length) {
+      box.innerHTML = '<div class="txt-muted fs-13">暂无回合记录</div>';
+      return;
+    }
+    box.innerHTML = logs.slice().reverse().map(l => {
+      const intent = (l.D_decision && l.D_decision.intent) || {};
+      const n = (l.D_decision && l.D_decision.orders && l.D_decision.orders.length) || 0;
+      return `<div class="card" style="margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span class="txt-mono fs-12" style="color:var(--text-primary)">T${l.turn} · ${l.date}</span>
+          <span class="badge badge-low">已归档</span>
+        </div>
+        <div class="setting-hint" style="margin-top:6px">${intent.rationale || intent.strategic_intent || "无意图记录"}</div>
+        <div class="setting-hint">推荐行动 ${n} 项</div>
+      </div>`;
+    }).join("");
+  } catch (e) { box.innerHTML = '<div class="txt-muted fs-13">加载失败</div>'; }
+}
+
+async function loadResults() {
+  const tb = document.getElementById("resultsBody");
+  if (!tb) return;
+  tb.innerHTML = '<tr><td colspan="7" class="txt-muted" style="text-align:center;padding:20px">载入战果台账…</td></tr>';
+  try {
+    const r = await fetch(API + "/results");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    const list = d.results || [];
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="7" class="txt-muted" style="text-align:center;padding:20px">尚无归档对局。<br><span style="font-size:12px">每局结束需执行： witp-cmd close-game --outcome ... </span></td></tr>';
+      return;
+    }
+    tb.innerHTML = list.map(g => {
+      const nm = (g.enemy_score != null && g.own_score != null)
+        ? [g.enemy_score, g.own_score]
+        : ["—", "—"];
+      return `<tr>
+        <td class="txt-mono fs-12" style="color:var(--text-primary)">${g.game_id || "—"}</td>
+        <td class="fs-12">${g.scenario || "—"}</td>
+        <td class="txt-mono fs-12">${g.final_date || "—"} T${g.final_turn != null ? g.final_turn : "—"}</td>
+        <td class="txt-mono fs-12" style="color:var(--error)">${nm[0]}</td>
+        <td class="txt-mono fs-12" style="color:var(--success)">${nm[1]}</td>
+        <td class="fs-12">${g.outcome || "—"}</td>
+        <td class="txt-mono fs-12">${g.turns_recorded != null ? g.turns_recorded : 0}</td>
+      </tr>`;
+    }).join("");
+  } catch (e) {
+    tb.innerHTML = '<tr><td colspan="7" class="txt-muted" style="text-align:center;padding:20px">台账加载失败</td></tr>';
+  }
+}
+
+function copyScores() {
+  navigator.clipboard.writeText(document.getElementById("scoresTable").innerText).then(() => toast("已复制"));
+}
+
+/* 初始化 */
+loadStatus();
+loadProposal();
+loadProviders();
+loadModelsConfig();
+loadResults();
+
+/* 自动实时轮询（每 10 秒静默检查状态与方案，若有变动自动无感更新） */
+setInterval(async () => {
+  try {
+    const prevTurn = latestTurnNum;
+    await loadStatus();
+    if (latestTurnNum && prevTurn && latestTurnNum !== prevTurn) {
+      await loadProposal();
+    } else {
+      const banner = document.getElementById("proposalAlertBanner");
+      if (banner && banner.style.display !== "none") {
+        await loadProposal();
+      }
+    }
+  } catch (e) {}
+}, 10000);
+</script>
+</body>
+</html>

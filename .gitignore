@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Environment & Secrets
+.env
+*.key
+*.pem
+*.token
+*secrets*
+config.yaml
+!config.yaml.example
+
+# WitP Runtime Data & Temporary Files
+*.pws
+*.tmp
+*.lock
+*.log
+*.xwd
+/reader/state/
+/reader/state.new/
+/reader/state.old/
+/reader/state_lastgood/
+/reader/control_maps/
+/staff/games/
+/staff/logs/
+/tmp/
+
+# OS & Editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

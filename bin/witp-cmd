@@ -1,0 +1,2984 @@
+#!/usr/bin/env python3
+"""
+witp-cmd: 前线指挥官与主 Agent 专用操作命令行工具 (Commander's Field Toolkit)
+充当主 Agent 的「手」：
+- witp-cmd staff           # 召唤参谋部出具《作战方案建议书》
+- witp-cmd launch          # 一键重开并就位珊瑚海 1942 新局
+- witp-cmd set-dest <tf> <x> <y>  # 亲手下达编队航向指令 (探针法+偏移补偿)
+- witp-cmd set-cap <ag> <pct>     # 亲手下达战斗机防空 CAP 比例指令
+- witp-cmd end-turn        # 亲手下达 E+YES 过回合指令并等待结算
+- witp-cmd status          # 检查当前屏幕画面与战局状态
+"""
+
+import sys
+import os
+import json
+import argparse
+import subprocess
+import time
+import re
+
+_VENV_PY = "/root/.hermes/hermes-agent/venv/bin/python3" if os.path.exists("/root/.hermes/hermes-agent/venv/bin/python3") else sys.executable
+
+# ──────────────────── TF 目的地设置的辅助函数（第六局新增） ────────────────────
+
+def _shot_to(path):
+    """截取游戏区画面（自动剔除窗口外区域）。
+
+    ★2026-09-25 加固（一）★ 必须**校验新鲜度**：
+      实测 `witp_shot_game` 偶发失败（截图尺寸断言不通过时直接 return 1），
+      但它失败时**不会覆盖** /tmp/witp_shot.png —— 若照样 `cp` 旧图，
+      后续 OCR 全部读到**上一帧**，表现为「读数卡住不变」，
+      极易被误判为控件/交互问题（本次排查即被误导数轮）。
+
+    ★2026-09-25 加固（二）★ **绝不能"先删再拍"**：
+      `witp_shot_game` 在 `witp_crop_ok` 失败时**直接 return 1 且不产出** /tmp/witp_shot.png。
+      旧实现先 `os.remove` 再重试 → 三次全失败后**一个文件都不剩**，
+      调用方 `Image.open` 抛异常 → 被 except 吞掉 → 表现为"读到 0 行"的静默失败
+      （`_read_tf_dest_dynamic` 返回 0 行即由此而来，解析逻辑本身没问题）。
+      改为 **mtime 递增判定 + 已有图兜底**：只要曾拍成过一次，目标路径就一定存在。
+    """
+    _p = "/tmp/witp_shot.png"
+    prev = os.path.getmtime(_p) if os.path.exists(_p) else 0.0
+    for _try in range(3):
+        subprocess.run(["bash", "-c",
+                        "source /root/.hermes/workspace/witp-ui.sh && witp_shot_game"],
+                       capture_output=True)
+        if os.path.exists(_p):
+            m = os.path.getmtime(_p)
+            if m > prev and (time.time() - m) < 30:
+                subprocess.run(["bash", "-c", f"cp {_p} {path}"], capture_output=True)
+                return True
+        time.sleep(0.6)
+    # 兜底：拍不出新图也要把现有图交出去，绝不留下不存在的目标路径
+    if os.path.exists(_p):
+        subprocess.run(["bash", "-c", f"cp {_p} {path}"], capture_output=True)
+    return False
+
+def _ocr(path, args="- psm 6"):
+    r = subprocess.run(f"tesseract {path} {args} 2>/dev/null", shell=True, capture_output=True, text=True)
+    return r.stdout
+
+def _ensure_tf_list_open():
+    """确保 TF 列表界面处于打开状态，并获取键盘/滚动焦点。"""
+    for attempt in range(3):
+        _shot_to("/tmp/_witp_check_tf_list.png")
+        txt = _ocr("/tmp/_witp_check_tf_list.png", args="- --psm 11")
+        if "Task Forces" in txt or "Air Ops" in txt or "SubOps" in txt or "SurfaceCombat" in txt:
+            return True
+        vnc_key("escape")
+        time.sleep(1.0)
+        focus_map()
+        vnc_key("t")
+        time.sleep(3.0)
+    return False
+
+def _scan_tf_numbers():
+    """扫描 T 列表编号列，返回 [(y_center, num_str)]（按 y 升序）。
+
+    ★2026-09-29 修复（换阵营暴露的系统性缺陷）★
+      原实现有三处**绑死盟军侧列表布局**的常量：
+        ① 编号列 x 阈值 `left < 225`；② 裁剪窗 `700x300+150+215`；③ 行距写死。
+      换日军侧后返回**空列表** → `_find_tf_row` 返回 None → `set-dest` 中止；
+      更糟的是原代码用 `return` 而非 `sys.exit(1)`，**退出码仍是 0**，
+      表现为「命令成功但游戏没变」的静默失败（极易误判为游戏挂起/时序问题）。
+
+      现改为**只认编号列窄带 + 强制 psm6 + 数字白名单**：
+        · 实测列表列头（TF/Mission/…）在 y≈215–240，编号列 x≈158–198。
+        · 大窗全表 TSV 会把编号列漏读（Mission 列起点 x≈197 紧贴编号列），
+          故**只裁编号列窄带**，逐行 TSV 归位，不依赖任何写死的列 x 阈值。
+        · **必须 `--psm 6`**：默认 psm 3 会把数字列读成乱码（实测 'ww'/'ho'/'Oah'）。
+        · 行 y 直接由 TSV top 换算（实测与行中心逐行相符，7 行全对）。
+    """
+    _shot_to("/tmp/_witp_cmd_row.png")
+    sc, ox, oy = 800, 158, 242
+    crop = "40x230+158+242"
+    cmd = (f"convert /tmp/_witp_cmd_row.png -crop {crop} +repage "
+           f"-resize {sc}% -colorspace Gray -normalize /tmp/_ryd.png && "
+           f"tesseract /tmp/_ryd.png stdout --psm 6 "
+           f"-c tessedit_char_whitelist=0123456789 tsv 2>/dev/null")
+    out = []
+    try:
+        raw = subprocess.check_output(cmd, shell=True, timeout=25).decode(errors="replace")
+        for line in raw.splitlines()[1:]:
+            parts = line.split("\t")
+            if len(parts) < 12:
+                continue
+            conf = float(parts[10]) if parts[10] not in ("-1", "") else 0
+            word = parts[11].strip()
+            if conf <= 20 or not re.fullmatch(r"\d{1,2}", word):
+                continue
+            y = int(int(parts[7]) * 100.0 / sc) + oy
+            out.append((y, word))
+    except Exception:
+        pass
+    # 同行去重（同数字重复识别取前者）
+    ded, seen = [], set()
+    for y, w in sorted(out):
+        if any(abs(y - yy) <= 5 for yy, _ in ded):
+            continue
+        ded.append((y, w))
+        seen.add(w)
+    return ded
+
+
+
+def _tf_ids_from_layer():
+    """从读层取 T 列表编号的**升序**列表（用于确定性行定位）。
+
+    ★设计要点★ 游戏 T 列表按编号升序排列，行距为 UI 常量。
+    因此 `行 y = BASE + PITCH × (编号在升序表中的下标)` **可解析算出**，
+    **完全不需要 OCR 定位行** —— 彻底消除 OCR 抖动导致的定位失败。
+    """
+    for p in ("/root/.hermes/workspace/witp-reader/state/taskforces.json",):
+        try:
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+            lst = (d if isinstance(d, list)
+                   else (d.get("task_forces") or d.get("taskforces") or []))
+            ids = sorted(int(t["record_id"]) for t in lst
+                         if isinstance(t.get("record_id"), int))
+            if ids:
+                return ids
+        except Exception:
+            pass
+    return []
+
+
+# T 列表控件几何常量（滚到顶后首行 y 与行距）——实测两阵营一致（同一列表控件）
+_TF_ROW_BASE = 246
+_TF_ROW_PITCH = 14
+
+
+def _row_num_at(y):
+    """读某一行编号列的窄带数字（用于确定性定位后的**定向核验**）。"""
+    _shot_to("/tmp/_witp_cmd_row.png")
+    sc, ox = 800, 158
+    crop = f"40x18+158+{int(y) - 9}"
+    cmd = (f"convert /tmp/_witp_cmd_row.png -crop {crop} +repage "
+           f"-resize {sc}% -colorspace Gray -normalize /tmp/_rn.png && "
+           f"tesseract /tmp/_rn.png stdout --psm 7 "
+           f"-c tessedit_char_whitelist=0123456789 2>/dev/null")
+    try:
+        raw = subprocess.check_output(cmd, shell=True, timeout=20).decode(errors="replace")
+        m = re.findall(r"\d{1,2}", raw)
+        return m[0] if m else None
+    except Exception:
+        return None
+
+
+def _find_tf_row(tf_id):
+    """定位 T 列表中目标 TF 所在行的中心 y。
+
+    ★2026-09-29 重写（换阵营暴露的系统性缺陷）★
+      原实现完全依赖 OCR 扫描编号列，有三处绑死盟军侧布局的常量
+      （编号列 x 阈值 225 / 裁剪窗 700x300+150+215 / 行距），换日军侧后
+      **返回空列表** → 定位失败 → `set-dest` 中止且退出码仍为 0（静默失败）。
+
+      新实现改为**确定性定位 + 定向核验**：
+        ① 滚到列表顶部（列表按编号升序）；
+        ② 从**读层** `taskforces.json` 取升序编号表；
+        ③ `y = BASE + PITCH × 下标` 解析算出（不 OCR）；
+        ④ 只对算出的一行做窄带 OCR **核验**；不符则在邻域微调；
+        ⑤ 读层缺失/核验全败时才回退全列 OCR 扫描。
+      这样 OCR 只用于「确认」而非「搜索」，把静默失败概率降到最低。
+    """
+    target = re.sub(r"[^0-9]", "", str(tf_id)).lstrip("0") or "0"
+
+    # ① 滚到列表顶部
+    vnc_click(250, 205, "click"); time.sleep(0.5)
+    for _ in range(4):
+        vnc_key("home"); time.sleep(0.35)
+    time.sleep(1.2)
+
+    # ② 全列扫描一次（仅作一致性校验；不用于逐行搜索）
+    rows = _scan_tf_numbers()
+    scan = {n: y for y, n in rows}
+
+    # ③ 读层升序表 → 解析算行
+    ids = _tf_ids_from_layer()
+    if ids and int(target) in ids:
+        idx = ids.index(int(target))
+        y0 = _TF_ROW_BASE + _TF_ROW_PITCH * idx
+
+        # 一致性校验：扫描行与公式行的吻合率
+        hit = sum(1 for i, n in enumerate(ids)
+                  if scan.get(str(n)) is not None
+                  and abs(scan[str(n)] - (_TF_ROW_BASE + _TF_ROW_PITCH * i)) <= 3)
+        if hit >= max(2, int(len(ids) * 0.6)):
+            # ★公式可信 → 以公式为准★
+            #   扫描此时仅作一致性门（防读层与可见列表不一致，如 Show 筛选隐藏编队）；
+            #   实测 OCR 会把行 5 的 '5' 误读成 '7'，若以扫描为准会把 TF7 定位到 TF5 的行。
+            if scan.get(target) is not None and abs(scan[target] - y0) > 3:
+                print(f"[witp-cmd] ⚠️ TF{target} 扫描读数 y={scan[target]} 与公式 y={y0} 不符"
+                      f"（一致性 {hit}/{len(ids)} 通过）→ 以公式为准")
+            return y0
+        print(f"[witp-cmd] ⚠️ 公式一致性仅 {hit}/{len(ids)} → 回退扫描定位")
+
+    # ④ 回退：直接用扫描结果
+    if scan.get(target) is not None:
+        return scan[target]
+
+    # 位置兜底：列表按编号升序，target 落在已识别区间内则按比例插值
+    nums = [(y, int(n)) for y, n in rows if n.isdigit()]
+    if len(nums) >= 2:
+        t = int(target)
+        for i in range(len(nums) - 1):
+            y0, n0 = nums[i]
+            y1, n1 = nums[i + 1]
+            if n0 < t < n1:
+                est = int(y0 + (y1 - y0) * (t - n0) / (n1 - n0))
+                print(f"[witp-cmd] ⚠️ 编号 {target} 未被 OCR 识别 → 按升序位置插值 y={est}（相邻行 {n0}/{n1}）")
+                return est
+
+    print(f"[witp-cmd] 未识别到编号 {target}；当前列表识别到的编号：{[n for _, n in rows]}")
+    return None
+
+_CONFUSE = str.maketrans({"O": "0", "o": "0", "D": "0", "Q": "0", "l": "1", "I": "1",
+                          "|": "1", "i": "1", "Z": "2", "z": "2", "S": "5", "s": "5",
+                          "B": "8", "g": "9", "b": "6", "G": "6", "T": "7", "q": "9"})
+
+
+def _extract_coord(txt):
+    """从一行 OCR 文本中提取目标 Hex 坐标（多级容错）。
+
+    第 1 级：识别 "move to 102,143" / "near to 102,143"（分隔符任意）
+    第 2 级：对易混字符（O/l/I/S/B/Z）做归一化后再试
+    第 3 级：兜底取行内最后两段 2~3 位数字
+    """
+    if not txt:
+        return None
+    for t in (txt, txt.translate(_CONFUSE)):
+        m = re.search(r"(?:moveto|nearto|near\s*to|move\s*to|to)\D{0,6}(\d{2,3})\D{1,3}(\d{2,3})",
+                      t, re.IGNORECASE)
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+    for t in (txt, txt.translate(_CONFUSE)):
+        nums = re.findall(r"\d{2,3}", t)
+        if len(nums) >= 2:
+            return (int(nums[-2]), int(nums[-1]))
+    return None
+
+
+def _read_tf_dest_from_list(tf_id):
+    """从 T 列表行中读出目标 TF 当前的目的地 Hex (x, y)。
+
+    2026-09-24 重写（四步修复，前三次失败已记录）：
+      1) 裁剪区原 x=150..850，Location 列延伸到 ~1010 → 扩到全宽。
+      2) 坐标分隔符原只认半角逗号，实测 tesseract 常读成点号或空格
+         ("moveto 106.142" / "moveto 106 142") → 恒不匹配。改用非数字分隔匹配。
+      3) 整块 psm6 OCR 会把 TF 编号读错（14→"_ 14"、15→"45"）
+         → 改为按行带逐行裁剪 + 单行 psm7。
+      4) 行左侧地图标签文字（"tagula"、岛名）混入行首 → 裁剪起点右移到 x=140。
+
+    定位策略：① 行首编号匹配（主）；② 行序兜底（T 列表按编号升序、
+    当前 11 个 Human 编队顺序固定为 14,15,16,17,18,20..25）。
+    注意：OCR 对数字 0/5/6/8 仍有误读可能，最终以读层 target_x/y 为准。
+    """
+    target = re.sub(r"[^0-9]", "", str(tf_id)).lstrip("0") or "0"
+    _shot_to("/tmp/_witp_read_dest.png")
+    # ★2026-10-01 修（换阵营暴露的「写死单侧」缺陷）★
+    #   原 ROW_YS/KNOWN_ORDER 是**盟军侧**的写死行位与编号序列
+    #   （14,15,16,17,18,20..25）—— 日军编队是 TF1..TF30，
+    #   二者完全对不上 ⇒ set-dest 在日军侧"行命中但读不到坐标"，永不收敛。
+    #   改为**确定性公式**（已在本项目实测）：T 列表按编号升序，行距固定 14px，
+    #   首行（编号最小者）中心 y=246 ⇒ y = 246 + 14 × (该编号在升序表中的下标)。
+    ROW_BASE, ROW_PITCH = 246, 14
+    try:
+        _ids = sorted(set(int(re.sub(r"[^0-9]", "", str(t)) or 0)
+                          for t in _tf_ids_from_layer()))
+    except Exception:
+        _ids = []
+    ROW_YS = []
+    KNOWN_ORDER = []
+    if _ids:
+        for i, n in enumerate(_ids):
+            KNOWN_ORDER.append(str(n))
+            ROW_YS.append(ROW_BASE + ROW_PITCH * i)
+        print(f"[witp-cmd] T 列表行位（读数层 {len(_ids)} 个编队动态生成）："
+              f"首行 y={ROW_YS[0]} 末行 y={ROW_YS[-1]}")
+    else:
+        # 读层不可用时回落一屏常见行位（仅作兜底，随后必然回读核验）
+        ROW_YS = [ROW_BASE + ROW_PITCH * i for i in range(12)]
+        KNOWN_ORDER = [str(i + 1) for i in range(12)]
+        print("[witp-cmd] ⚠ 读层编队列表不可用，T 列表行位按 1..12 兜底（务必回读核验）")
+    from PIL import Image, ImageOps
+    rows = []
+    try:
+        full = Image.open("/tmp/_witp_read_dest.png")
+        for y in ROW_YS:
+            crop = full.crop((140, y - 9, 1024, y + 9))
+            crop = ImageOps.autocontrast(ImageOps.grayscale(crop))
+            crop = crop.resize((crop.width * 4, crop.height * 4), Image.LANCZOS)
+            crop.save("/tmp/_trow.png")
+            # ★2026-09-24 修复★ 单次 psm7 对个别编队（实测 TF14）恒返回 None：
+            #   改为 psm 7→6→13 三轮尝试 + 易混字符归一化 + 末两段数字兜底。
+            coord = None
+            txt = ""
+            for _psm in ("7", "6", "13"):
+                txt = _ocr("/tmp/_trow.png", f"- --psm {_psm}")
+                txt = re.sub(r"([0-9])[ilI|]([0-9])", r"\1\2", txt)
+                coord = _extract_coord(txt)
+                if coord:
+                    break
+            mn = re.match(r"\D{0,8}(\d{2})\D", txt)
+            num = ((mn.group(1).lstrip("0") or "0") if mn else None)
+            rows.append({"num": num, "coord": coord})
+    except Exception:
+        return None
+    # 策略①：行首编号匹配
+    for r in rows:
+        if r["num"] == target and r["coord"]:
+            return r["coord"]
+    # 策略②：行序兜底（T 列表数据行按编号升序排列）
+    for i, r in enumerate(rows):
+        if i < len(KNOWN_ORDER) and KNOWN_ORDER[i] == target and r["coord"]:
+            return r["coord"]
+    return None
+
+
+# ★2026-09-24 新增：探针标定值缓存★
+#   探针点 (500,500) 对应的 hex 由「屏幕位置」决定，与操作哪个编队无关
+#   （实测 TF16/18/20 均读出 (112,144)）。个别编队因 OCR 字型误读会得到
+#   稳定但错误的值（如 TF15 恒读成 (412,144)），此时复用已成功标定值即可。
+PROBE_CACHE_FILE = "/tmp/witp_probe_cache.json"
+
+
+def _load_probe_cache():
+    try:
+        with open(PROBE_CACHE_FILE) as f:
+            d = json.load(f)
+        h = d.get("hex")
+        if h and len(h) == 2:
+            return (int(h[0]), int(h[1]))
+    except Exception:
+        pass
+    return None
+
+
+def _save_probe_cache(h):
+    try:
+        with open(PROBE_CACHE_FILE, "w") as f:
+            json.dump({"hex": [int(h[0]), int(h[1])], "ts": time.time()}, f)
+    except Exception:
+        pass
+
+
+def _find_airgroup_row(ag_id, list_key="a"):
+    """用 TSV 按行归并识别航空队名，返回目标行中心 y。
+
+    ★2026-09-24 重写（根因修复）★
+      原实现从 y=240 起按固定步长 14 逐行裁剪。实测 N 列表**首行中心在 y≈259**
+      （即 245+14k），从 240 起扫会整行错位 → 每行都跨两行文字 → OCR 全乱码，
+      舰载中队因此**从未成功定位**（set-cap 对舰载机完全失效）。
+      改为：对名称列做整块 TSV，按 y 归并成行后再匹配名称 —— 与步长/首行偏移无关。
+    """
+    from PIL import Image, ImageOps
+    import collections
+    import csv as _csv
+
+    clean_target = re.sub(r"[^A-Za-z0-9]", "", str(ag_id)).lower()
+    _shot_to("/tmp/_witp_air_rows.png")
+    im = Image.open("/tmp/_witp_air_rows.png").crop((150, 230, 440, 500))
+    im = ImageOps.autocontrast(ImageOps.grayscale(im)).resize((im.width * 4, im.height * 4), Image.LANCZOS)
+    im.save("/tmp/_anames.png")
+    subprocess.run("tesseract /tmp/_anames.png /tmp/_anames --psm 6 tsv 2>/dev/null", shell=True)
+
+    lines = collections.defaultdict(list)
+    try:
+        with open("/tmp/_anames.tsv") as f:
+            for r in _csv.DictReader(f, delimiter="\t", quoting=_csv.QUOTE_NONE):
+                t = (r.get("text") or "").strip()
+                if not t:
+                    continue
+                y = int(r["top"]) / 4.0 + 230
+                lines[round(y / 7)].append((int(r["left"]) / 4.0 + 150, t))
+    except Exception:
+        return None
+
+    # ★2026-09-26 关键加固★ 航空队名匹配加「字形混淆归一 + 唯一性要求」。
+    #   实测 N 列表 OCR 会把 **V 读成 Y 或 N**（真身 VS-5 → OCR `ys5sbd3dauntlessy16`；
+    #   1/VCS-5 → `lvcss50c1seagull4`），导致 VS-2/VS-5 这类**舰载专职侦察中队**
+    #   永远匹配不上 —— 侦察落子因此长期失效（失败日志显示"识别到的行"里明明有它）。
+    #   归一规则：V/Y→v、I/L/|→1、O→0、S→5、B→8（在既有 i/l→1、o→0、S→5、B→8 上补 V↔Y）。
+    #   ★安全底线★ 必须**唯一命中**才认；命中多行一律拒收 —— 宁可失败也不改错部队。
+    def _canon(s):
+        s = re.sub(r"[^A-Za-z0-9]", "", str(s)).lower()
+        # ★2026-10-01 补：编号段字形归一 ★
+        #   实测 OCR 把日军中队编号 `K-1` 读成 `K41`、`K-2` 读成 `K2`，
+        #   而 `1` 也常被读成 `4`/`l`/`i`。若不做二次归一，
+        #   `Genzan Ku K-1`(→genzankuk1) 永远对不上 OCR 的 `genzankuk41`。
+        #   规则：数字位统一 4→1（4 在该位置只会是 1 的误读），i/l→1。
+        s = s.replace("y", "v").replace("i", "1").replace("l", "1")
+        s = s.replace("o", "0").replace("s", "5").replace("b", "8")
+        s = re.sub(r"4", "1", s)          # 编号位 4 视为 1 的误读
+        return s
+
+    ct = _canon(ag_id)
+    hits = []
+    seen = []                      # ← 必须初始化！上次改这段时漏了，导致 NameError
+    for k in sorted(lines):
+        ws = sorted(lines[k])
+        txt = " ".join(w for _, w in ws)
+        norm = re.sub(r"[^A-Za-z0-9]", "", txt).lower()
+        yc = int(k * 7) + 6
+        seen.append(f"{yc}:{norm[:18]}")
+        if ct and ct in _canon(txt):
+            hits.append(yc)
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        print(f"[witp-cmd] ⚠️ {ag_id} 归一后命中多行 {hits} → **拒收**（不猜，避免改错部队）")
+        print(f"   识别到的行 → {seen[:16]}")
+        return None
+    # ★2026-09-26 兜底★ 设计ator（编号段）被 OCR 读烂时按**后缀**再匹配一次。
+    #   `No.11 Sqd RAAF` 的编号被读成 `noid`；尾部的 `5qdraaf`（Sqd RAAF）匹配良好。
+    #
+    # ★2026-09-30 修（换阵营暴露的「判据过严」缺陷）★
+    #   日军中队**共用后缀**：`EI-1 Daitai`/`EII-1 Daitai` 后缀都是 `da1ta1`，
+    #   `EIII-1 Chutai`/`EIII-2 Chutai` 后缀都是 `1chuta1`/`2chuta1` ⇒
+    #   原「必须唯一命中，多则拒收」的规则使**四支舰战中队全部被拒**，航母 CAP 一个都设不上。
+    #   该唯一性要求是照**盟军**命名（VF-2/VB-2/VS-2 后缀互异）写的，换侧即失效。
+    #   修法：歧义时不立刻拒收，改用**编号段**（后缀之前的部分，如 `ei1`/`eii1`）在候选行里二次判别；
+    #   仍不唯一才拒收。编号段读烂时退化为「候选里取第一个」，但**必须打印告警**，不静默。
+    if len(ct) > 8:
+        _tail = ct[4:]
+        _h2 = []
+        for k in sorted(lines):
+            _txt = " ".join(w for _, w in sorted(lines[k]))
+            if _tail and _tail in _canon(_txt):
+                _h2.append((int(k * 7) + 6, _canon(_txt)))
+        if len(_h2) == 1:
+            print(f"[witp-cmd] ⓘ {ag_id} 编号段 OCR 不可辨，按后缀 '{_tail}' 唯一命中 y={_h2[0][0]}")
+            return _h2[0][0]
+        if len(_h2) > 1:
+            # ★二次判别：用编号段（ct 的前 4 位，如 ei1/eii1）在候选里筛 ★
+            _head = ct[:4]
+            _h3 = [(y, t) for (y, t) in _h2 if _head and _head in t]
+            if len(_h3) == 1:
+                print(f"[witp-cmd] ⓘ {ag_id} 后缀歧义（{len(_h2)} 行），按编号段 '{_head}' 二次判别 → y={_h3[0][0]}")
+                return _h3[0][0]
+            # 编号段也判不出来：若全部候选同属一个「编号前缀族」仍不唯一 → 拒收，避免改错部队
+            print(f"[witp-cmd] ⚠️ {ag_id} 后缀 '{_tail}' 命中 {len(_h2)} 行且编号段 '{_head}' "
+                  f"无法唯一判别 → **拒收**（不猜）")
+            for (y, t) in _h2[:8]:
+                print(f"      候选 y={y}: {t[:40]}")
+            return None
+    print(f"[witp-cmd] 未匹配到 {ag_id}；该列表识别到的行 → {seen[:16]}")
+    return None
+
+
+def _scroll_map(direction, seconds):
+    """★2026-10-01 新增（手册 4.2.5 权威 + 实测）★ 用「鼠标停画面边缘」滚动地图视野。
+
+    手册 4.2.5 原文：「use the arrow keys or **scroll the mouse cursor to the Tactical
+    Map's edges** in order to move the map view」。
+
+    ★实测关键（此前多次测「边缘无效」的真因）★
+      触发带**只有窗口绝对最外 1 像素**：
+        左 x=0 / 右 x=1023 / 下 y=767  → 有效（画面变化 22~24%）
+        内侧 x=3 / x=1022 / y=766      → **完全无效**（0.0%）
+      上边缘 y=0 被窗口标题栏占用，实测不可用。
+    方向语义（内容位移反推）：停左边缘→视野西移；停右边缘→视野东移；停下边缘→视野南移。
+    """
+    pt = {"west": (0, 380), "east": (1023, 380), "south": (500, 767)}.get(direction)
+    if not pt:
+        return False
+    vnc_click(500, 300, "click") if False else None
+    try:
+        from lib.executor import vnc_click as _vc
+        _vc(pt[0], pt[1], "click") if False else None
+    except Exception:
+        pass
+    # 只移动，不点击
+    import subprocess as _sp
+    _ox, _oy = get_window_offset() if "get_window_offset" in globals() else (188, 150)
+    _sp.run(["xdotool", "mousemove", str(int(_ox + pt[0])), str(int(_oy + pt[1]))],
+            env={**os.environ, "DISPLAY": ":98"}, check=False)
+    time.sleep(seconds)
+    _sp.run(["xdotool", "mousemove", str(int(_ox + 500)), str(int(_oy + 300))],
+            env={**os.environ, "DISPLAY": ":98"}, check=False)
+    time.sleep(0.6)
+    return True
+
+
+def _click_map_hex(tx, ty):
+    """在地图上点击目标 hex。
+
+    ★2026-09-29 修正★ 原按 42.86/37.5 px/格写死换算（实测真值约 40.0）。
+    现改为读标定值并过范围闸门，超范围回落 40.0。
+
+    ★2026-10-01 追加★ 基准格 `_current_cursor_hex()` 实测**不可靠**：
+    顶栏 Hex 是「上次点击选中的格」，**不随鼠标移动更新**（只移动鼠标时 Hex 恒定），
+    故它给出的基准格可能是很早以前的点击残留 → 换算全错、视野不动。
+    对策：**先用边缘滚动把目标拉进视野半径**，再按标定点击；若基准格明显不可信
+    （与目标距离超过一个屏宽对应的格数），先滚动再算。
+    """
+    cur = _current_cursor_hex()
+    if cur is None:
+        vnc_click(512, 384, "click")
+        return
+    W = H = None
+    try:
+        import sys as _s
+        _s.path.insert(0, "/root/.hermes/profiles/witp/witp-agent")
+        from lib import mapgeom as _mg
+        g = _mg.load_geom()
+        if g:
+            W, H = float(g["W"]), float(g["H"])
+    except Exception:
+        pass
+    if W is None or H is None or not (25.0 <= W <= 60.0) or not (25.0 <= H <= 60.0):
+        W, H = 40.0, 40.0
+    cx, cy = cur
+    # ★2026-10-01 追加：基准格不可信时先用边缘滚动逼近 ★
+    #   基准格 `cur` 来自顶栏 Hex（= 上次点击选中的格），可能已过期。
+    #   若它与目标的距离超过半屏所能覆盖的格数（W≈42.5px/格、半屏 512px ≈ 12 格），
+    #   直接按它换算会点出屏幕 → 视野纹丝不动（这正是 set-dest 长期"不收敛"的成因）。
+    #   对策：先按方位滚动，把目标拉进视野半径内，再点击。
+    for _ in range(6):
+        dxh, dyh = tx - cx, ty - cy
+        if abs(dxh) <= 11 and abs(dyh) <= 9:
+            break
+        moved = False
+        if dxh < -11:
+            moved = _scroll_map("east", min(2.5, max(0.8, abs(dxh) * 0.055)))
+        elif dxh > 11:
+            moved = _scroll_map("west", min(2.5, max(0.8, abs(dxh) * 0.055)))
+        if dyh > 9:
+            moved = _scroll_map("south", min(2.5, max(0.8, abs(dyh) * 0.055))) or moved
+        elif dyh < -9:
+            # 北向无可用边缘（上边缘被标题栏占用）——用东西向滚动配合地图绕行不成立，
+            # 故此分支保持原状并明确告警，交由调用方核验。
+            pass
+        if not moved:
+            print(f"[witp-cmd] ⚠ 视野滚动无法继续逼近（基准格({cx},{cy}) 距目标({tx},{ty}) "
+                  f"过远且北向边缘不可用）；仍按标定点击，落点请以结算后读层核验")
+            break
+        cur = _current_cursor_hex()
+        if cur is None:
+            break
+        cx, cy = cur
+    gx = 512 + (tx - cx) * W
+    gy = 384 + (ty - cy) * H
+    gx = max(30, min(994, int(gx)))
+    gy = max(30, min(738, int(gy)))
+    print(f"[witp-cmd] 光标格 ({cx},{cy}) → 目标 ({tx},{ty}) "
+          f"点击 ({gx},{gy})  [比例 {W:.1f}/{H:.1f} px/格]")
+    vnc_click(gx, gy, "click")
+    time.sleep(1.0)
+
+def _parse_hex_field(txt, last=None):
+    """宽容但**严格校验**地解析顶栏 Hex 字段。
+
+    ★2026-09-25 实测两个坑★
+      ① 裁剪起点太靠右（x=884）会把首位数字切掉：`Hex:100 140` → 只剩 "4014"，
+         解析器用 (2,2) 切分当作 (40,14) 接受 → **静默错误**（比读不出更危险）。
+      ② 阈值二值化会毁掉抗锯齿笔画，导致丢字。故先试「不二值化 + autocontrast」。
+    现规则：必须出现 `Hex` 标签；数字串优先 3+3 切分；**至少 5 位数字**；
+    若给了 last（上次成功读数）则再要求不做离谱跳变（|Δ|≤40），否则拒收。
+    """
+    if not txt:
+        return None, None
+    t = re.sub(r"\s+", "", txt)
+    m = re.search(r"[Hh][e3a][xXkK][:;.,]?", t)
+    if not m:
+        return None, None                      # 没读到标签 → 一律拒收
+    digits = re.sub(r"\D", "", t[m.end():])[:6]
+    if len(digits) < 5:                        # 真正的 hex 至少 5 位（如 100140 / 99155）
+        return None, None
+    cands = []
+    for a, b in ((3, 3), (3, 2), (2, 3)):
+        if len(digits) >= a + b:
+            x, y = int(digits[:a]), int(digits[a:a + b])
+            if 10 <= x <= 250 and 10 <= y <= 250:
+                cands.append((x, y))
+    if not cands:
+        return None, None
+    if last:
+        good = [c for c in cands if abs(c[0] - last[0]) <= 40 and abs(c[1] - last[1]) <= 40]
+        if not good:
+            return None, None                  # 与上次读数跳变过大 → 判为误读
+        return good[0]
+    return cands[0]
+
+
+def _current_cursor_hex(last=None):
+    """从顶栏读当前光标 hex（宽裁剪 + 多策略 OCR + 严格校验 + 重试）。"""
+    from PIL import Image, ImageOps
+    for _attempt in range(3):
+        _shot_to("/tmp/_witp_cmd_hex.png")
+        try:
+            im = Image.open("/tmp/_witp_cmd_hex.png").crop((876, 0, 1000, 24))
+        except Exception:
+            time.sleep(0.4)
+            continue
+        g = ImageOps.autocontrast(ImageOps.grayscale(im))
+        for th in (None, None, 130, 110):      # 先两次不二值化（保笔画），再试阈值
+            img = g if th is None else g.point(lambda p, t=th: 255 if p > t else 0)
+            img = img.resize((img.width * 6, img.height * 6), Image.LANCZOS)
+            img.save("/tmp/_witp_cmd_hex_zoom.png")
+            h = _parse_hex_field(_ocr("/tmp/_witp_cmd_hex_zoom.png", "- --psm 7"), last)
+            if h[0] is not None:
+                return h
+        time.sleep(0.4)
+    return None
+
+
+
+# ─── 动态行识别版：T 列表编队目的地读取（2026-09-25 新增，取代写死的 ROW_YS/KNOWN_ORDER）───
+# 动机：旧实现用固定 ROW_YS=[250,264,...] 逐行裁剪 + 行序兜底（写死 14,15,16,17,18,20..25），
+#   既**绑死剧本**，也是「TF16 读出 TF17 的目标」这类**读错行**的根源。
+# 新做法：动态切行带（idgets.bright_row_bands）→ 分两段窄裁剪 OCR：
+#   ① 行首编号列 x≈163-200（做实体校验）② 目的地列 x≈712-1000（读 moveto/near to 后的坐标）
+#   并把 OCR 字形混淆纳入解析（i/l→1、o→0），关键词自身也容忍混淆（m0vet0/nearto）。
+_TF_ID_COL = (166, 182)      # ★实测★ 行首编号列。**切勿放宽**：x163 起会混入左标记、
+                             #   再宽会混入单位图标，OCR 随即把 "13" 读成 "43"、"14" 读成 "44"
+                             #   （编号列真值：13,14,15,16,17,18,20..25 全对）
+_TF_DEST_COL = (712, 1000)
+_TF_LIST_BOX = (160, 240, 200, 440)
+
+
+def _ocr_strip(x0, y0, x1, y1, whitelist=None, psm=7):
+    from PIL import Image, ImageOps
+    try:
+        img = Image.open("/tmp/_witp_tfl.png").convert("RGB")
+    except Exception:
+        return ""
+    c = ImageOps.autocontrast(img.crop((x0, y0, x1, y1)).convert("L"))
+    c = c.resize((c.width * 8, c.height * 8), Image.LANCZOS)
+    c.save("/tmp/_witp_strip.png")
+    args = f"- --psm {psm}" + (f" -c tessedit_char_whitelist={whitelist}" if whitelist else "")
+    return _ocr("/tmp/_witp_strip.png", args).strip()
+
+
+def _parse_dest_text(txt, numeric_hint=None):
+    """解析目的地列文本。返回 (x,y) 或 None（基地名 / at sea 一律返回 None，不猜）。
+
+    ★2026-09-26 关键修正★ 坐标一律以 **numeric_hint**（对同一区域用「纯数字白名单」
+      再 OCR 一遍的结果）为准，**判据不得再用「字母→数字」替换**。
+      实证：游戏字体里 `9` 与 `S` 形近，OCR 会把真值 `109` 读成 `10S`；
+      而旧实现在数值段做 `S→5`，于是 `10S` 被改成假的 **105** ——
+      set-dest 明明已精确设到 (109,142) 并报收敛，核验却读回 (105,142)，
+      造成"报成功却核验不符"的假矛盾（视觉放大 5 倍逐字符确认真值就是 109）。
+      数字白名单 OCR 不给字母留余地，从根上消除这类误读。
+    """
+    if not txt:
+        return None
+    t = re.sub(r"\s+", "", txt)
+    m = re.search(r"m[o0]v[e3]t[o0]|n[e3][a4]r[a4]?t[o0]?", t, re.I)
+    seg = t[m.end():] if m else t
+    # ① 优先用数字白名单读到的数字串（≥4 位才够一组 x,y）
+    if numeric_hint:
+        hd = re.sub(r"\D", "", numeric_hint)
+        for a, b in ((3, 3), (3, 2), (2, 3)):
+            if len(hd) >= a + b:
+                x, y = int(hd[:a]), int(hd[a:a + b])
+                if 10 <= x <= 250 and 10 <= y <= 250:
+                    return (x, y)
+    # ② 回退：从通用 OCR 文本取数字（保留 i/l→1、o→0，但**不再做 S→5/B→8**）
+    seg2 = (seg.replace("i", "1").replace("l", "1").replace("I", "1")
+               .replace("o", "0").replace("O", "0"))
+    nums = re.findall(r"\d{2,3}", seg2)
+    if len(nums) >= 2:
+        x, y = int(nums[0]), int(nums[1])
+        if 10 <= x <= 250 and 10 <= y <= 250:
+            return (x, y)
+    d = re.sub(r"\D", "", seg2)
+    for a, b in ((3, 3), (3, 2), (2, 3)):
+        if len(d) >= a + b:
+            x, y = int(d[:a]), int(d[a:a + b])
+            if 10 <= x <= 250 and 10 <= y <= 250:
+                return (x, y)
+    return None
+
+
+
+def _read_dest_coords(yc):
+    """★2026-09-26 新增★ 按「词框」逐词读目的地坐标，返回 ((x,y) 或 None, 原文)。
+
+    为什么不能整段 OCR：游戏字体里 `9` 与 `S` 形近，整段会把 `109` 读成 `10S`，
+    再怎么归一都救不回来（S→5 会变 105、丢 S 又会切分错乱）。
+    改为：TSV 拿到每个词的精确框 → 只对**坐标词**各自裁剪、放大 10 倍、
+    用数字白名单单独 OCR → 单字符歧义大幅下降（实测可稳定读出 109）。
+    """
+    import collections, csv as _csv
+    from PIL import Image, ImageOps
+    _shot_to("/tmp/_witp_tfl.png")
+    im = Image.open("/tmp/_witp_tfl.png").convert("RGB")
+    x0, x1 = _TF_DEST_COL[0], _TF_DEST_COL[1]
+    crop = im.crop((x0, yc - 7, x1, yc + 7))
+    crop = ImageOps.autocontrast(ImageOps.grayscale(crop)).resize(
+        (crop.width * 3, crop.height * 3), Image.LANCZOS)
+    crop.save("/tmp/_dest_tsv.png")
+    subprocess.run("tesseract /tmp/_dest_tsv.png /tmp/_dest_tsv --psm 7 tsv 2>/dev/null",
+                   shell=True)
+    words = []
+    try:
+        with open("/tmp/_dest_tsv.tsv") as f:
+            for r in _csv.DictReader(f, delimiter="\t", quoting=_csv.QUOTE_NONE):
+                t = (r.get("text") or "").strip()
+                if not t:
+                    continue
+                left = int(r["left"]) / 3.0
+                w = int(r["width"]) / 3.0
+                words.append((left, w, t))
+    except Exception:
+        return None, ""
+    words.sort()
+    raw = " ".join(w[2] for w in words)
+    # 坐标词 = 去掉关键词后、形如「2~3 位数字（或含 1 个字母）且含数字」的词
+    cand = [w for w in words
+            if 2 <= len(w[2]) <= 3 and any(ch.isdigit() for ch in w[2])
+            and not re.search(r"[A-Za-z]{2,}", w[2])]
+    if len(cand) < 2:
+        return None, raw
+    xw, yw = cand[-2], cand[-1]
+
+    def _word_num(w):
+        _shot_to("/tmp/_witp_tfl.png")
+        im2 = Image.open("/tmp/_witp_tfl.png").convert("RGB")
+        c = im2.crop((int(x0 + w[0]) - 1, yc - 7, int(x0 + w[0] + w[1]) + 2, yc + 7))
+        c = ImageOps.autocontrast(ImageOps.grayscale(c))
+        c = c.resize((c.width * 10, c.height * 10), Image.LANCZOS)
+        c.save("/tmp/_wordnum.png")
+        t = _ocr("/tmp/_wordnum.png", "- --psm 8 -c tessedit_char_whitelist=0123456789")
+        dg = re.sub(r"\D", "", t)
+        return int(dg) if dg else None
+    x, y = _word_num(xw), _word_num(yw)
+    if x is None or y is None:
+        return None, raw
+    if 10 <= x <= 250 and 10 <= y <= 250:
+        return (x, y), raw
+    return None, raw
+
+
+def _expected_base_name(tx, ty):
+    """★2026-09-26 新增★ 目标格若是基地，返回该基地名。
+    用途：长距离目的地在 T 列表里显示为**基地名而非坐标**（实测 TF14 去 Townsville
+    时显示 `Townsville, moveto`），坐标型回读必然判 None —— 不改的话会把
+    "设对了"误判成"回读失败"，更糟的是把"设错了基地"（实测误设成 Lunga）也一起掩盖。
+    """
+    try:
+        with open("/root/.hermes/workspace/witp-reader/state/bases.json", encoding="utf-8") as f:
+            bl = json.load(f)
+        for b in bl:
+            if b.get("x") == tx and b.get("y") == ty:
+                return b.get("name")
+    except Exception:
+        pass
+    return None
+
+
+def _base_from_dest_text(txt):
+    """★2026-09-26 新增★ 从目的地文本里抠出基地名。
+    目的地显示为基地时的形态是 `<基地名>, moveto` / `<基地名>, at sea` / `<基地名>. moveto`。
+    实测：长距离目的地（如回澳大利亚修船）会显示基地名而不是坐标，
+    此时坐标型回读必然判 None —— 不改的话 set-dest 就彻底没有反馈、原地空转。
+    """
+    if not txt:
+        return None
+    t = re.sub(r"\s+", " ", str(txt)).strip()
+    # 去掉关键词，剩下前面的部分就是基地名
+    t = re.sub(r"(?i)(,\s*|\s+)?(move\s*to|moveto|near\s*to|nearto|at\s*sea).*$", "", t).strip(" ,.\t")
+    t = re.sub(r"[^A-Za-z ]", "", t).strip()
+    return t if len(t) >= 3 else None
+
+
+def _base_hex_by_name(name):
+    """按基地名（容忍 OCR 噪声）在 bases.json 里反查其格坐标。"""
+    if not name:
+        return None
+    def _c(x):
+        return re.sub(r"[^a-z]", "", str(x).lower())
+    key = _c(name)
+    if len(key) < 3:
+        return None
+    try:
+        with open("/root/.hermes/workspace/witp-reader/state/bases.json", encoding="utf-8") as f:
+            bl = json.load(f)
+    except Exception:
+        return None
+    best = None
+    for b in bl:
+        bn = _c(b.get("name"))
+        if not bn:
+            continue
+        # 前缀/子串双向匹配（OCR 常吞尾字母，如 Townsville→Townsvi）
+        if key[:6] and (key[:6] in bn or bn[:6] in key):
+            x, y = b.get("x"), b.get("y")
+            if isinstance(x, int) and isinstance(y, int) and 0 < x < 65535:
+                best = (x, y)
+                break
+    return best
+
+def _read_tf_dest_dynamic(tf_id):
+    """动态读取 TF 目的地：返回 ((x,y) 或 None, 诊断dict)。
+
+    **行校验**：只有行首编号列读出与 tf_id 相符（或包含）才认这一行；
+    读不出编号的行一律跳过（**宁可失败也不读错行**）。
+    """
+    import sys as _s
+    _s.path.insert(0, "/root/.hermes/profiles/witp/witp-agent")
+    from lib import widgets as W
+    from PIL import Image                      # ★必须！witp-cmd 全文件均为函数内懒加载 PIL
+    ok = _shot_to("/tmp/_witp_tfl.png")
+    diag = {"rows": [], "matched_y": None, "shot_ok": bool(ok), "err": None}
+    p_img = "/tmp/_witp_tfl.png"
+    if not os.path.exists(p_img):
+        p_img = "/tmp/witp_shot.png"          # 兜底，绝不静默失败
+    try:
+        img = Image.open(p_img).convert("RGB")
+    except Exception as e:
+        diag["err"] = f"{type(e).__name__}: {e} (读 {p_img}, shot_ok={ok})"
+        return None, diag
+    diag["img"] = p_img
+    imgL = img.convert("L")                    # 编号列逐行裁剪用（避免每行重开图）
+    want = str(int(re.sub(r"\D", "", str(tf_id)) or "0"))   # 容忍 "TF15"/"tf15"/15
+    # ★2026-09-26 修缺陷A★ 保留行带的**自身上下界**，裁剪时用它而不是"行心±6"。
+    #   实测行距仅 14px，而 ±6 的裁剪窗高 13px，会把相邻行的字头/字尾一起裁进来
+    #   → 读出 `Lunsa. moveto moveto 108.135 moveto 108.135` 这种**多行串读**，
+    #   坐标被污染成 None，set-dest 随即失去反馈。
+    _bands = [( (a + b) // 2, a, b ) for a, b in W.bright_row_bands(img, _TF_LIST_BOX, min_px=2)]
+    for yc, _ya, _yb in _bands:
+        # ★编号列：LANCZOS x6 + 裁剪 ±7★ 实测 12/12 全对（13,14,15,16,17,18,20..25）：
+        #   · x8 会把 "6" 糊成 "5"（TF16→TF15），x4 会吐 "423"/"414" 之类垃圾
+        #   · 裁剪 ±6 会切掉首行字形顶部（13→4），±7 才齐
+        #   切勿改用 _ocr_strip 的 8x。
+        from PIL import ImageOps as _IO
+        _c = _IO.autocontrast(imgL.crop((_TF_ID_COL[0], yc - 7, _TF_ID_COL[1], yc + 7)))
+        _c = _c.resize((_c.width * 6, _c.height * 6), Image.LANCZOS)
+        _c.save("/tmp/_witp_idcol.png")
+        idt = _ocr("/tmp/_witp_idcol.png",
+                   "- --psm 7 -c tessedit_char_whitelist=0123456789").strip()
+        idi = re.sub(r"\D", "", idt)
+        # ★2026-09-26 回退★ 去掉「逐词框精读」主通道：实测它对小字号更脆
+        #   （把 105,135 那类读成 `LO? 139`，连数字都保不住，反而让 set-dest 变瞎）。
+        #   回到整段 OCR + _parse_dest_text（已去掉会主动制造错误的 S→5/B→8 归一）。
+        #   回读本就只是便利通道，**权威核验一律以结算后读层的 target_x/y 为准**。
+        _dtop, _dbot = max(0, _ya - 1), min(img.height, _yb + 2)
+        dest = _ocr_strip(_TF_DEST_COL[0], _dtop, _TF_DEST_COL[1], _dbot)
+        d = _parse_dest_text(dest)
+        _bn = None if d else _base_from_dest_text(dest)      # ★缺陷B★ 基地名型目的地
+        if d is None and not _bn:
+            # ★2026-09-26 兜底★ 通用 OCR 把数字读成字母时（实测 TF16 的 `moveto LO? 141`，
+            #   即 1↔L、0↔O、9↔S 这类字形歧义），用**数字白名单**再读一次强制出数字。
+            #   只在通用读法拿不到坐标/基地名时才用，避免污染正常读数。
+            _dnum = _ocr_strip(_TF_DEST_COL[0], _dtop, _TF_DEST_COL[1], _dbot, "0123456789")
+            _dg = re.sub(r"\D", "", _dnum or "")
+            if len(_dg) >= 4:
+                for _a2, _b2 in ((3, 3), (3, 2), (2, 3)):
+                    if len(_dg) >= _a2 + _b2:
+                        _x2, _y2 = int(_dg[:_a2]), int(_dg[_a2:_a2 + _b2])
+                        if 10 <= _x2 <= 250 and 10 <= _y2 <= 250:
+                            d = (_x2, _y2)
+                            diag.setdefault("num_fallback", []).append((yc, _dnum))
+                            break
+        diag["rows"].append({"y": yc, "id_read": idi, "dest_text": dest[:40],
+                             "dest": d, "base_name": _bn})
+        if idi == want or (idi and want in idi):
+            # ★2026-09-26 多采样投票★ 目标列 OCR 会在 **9 与 S、5 之间摇摆**
+            #   （实测 TF14 真值 109 被读成 "10S"，而 S→5 归一又把它变成假的 105，
+            #    直接导致"set-dest 报收敛成功、核验脚本却读回不符"的矛盾）。
+            #   故对命中行重复读取 3 次、取**多数一致**的解析；不一致则报 None（不猜）。
+            votes = {}
+            d0 = d
+            if d0:
+                votes[tuple(d0)] = votes.get(tuple(d0), 0) + 1
+            for _k in range(2):
+                _shot_to("/tmp/_witp_tfl.png")
+                _t = _ocr_strip(_TF_DEST_COL[0], yc - 6, _TF_DEST_COL[1], yc + 6)
+                _d = _parse_dest_text(_t)
+                diag["rows"].append({"y": yc, "id_read": idi, "dest_text": _t[:40],
+                                     "dest": _d, "resample": _k + 2})
+                if _d:
+                    votes[tuple(_d)] = votes.get(tuple(_d), 0) + 1
+            if votes:
+                best, cnt = max(votes.items(), key=lambda kv: kv[1])
+                if cnt >= 2 and len(votes) > 1:
+                    print(f"[witp-cmd] ⓘ TF{tf_id} 目标列多次读数不一致 {list(votes)}"
+                          f" → 取多数 {best}（OCR 在 9/S、5 间摇摆）")
+                elif len(votes) > 1 and cnt < 2:
+                    print(f"[witp-cmd] ⚠️ TF{tf_id} 目标列读数全不一致 {list(votes)}"
+                          f" → **判为读不出**（不猜）")
+                    diag["matched_y"] = yc
+                    return None, diag
+                diag["matched_y"] = yc
+                return tuple(best), diag
+            diag["matched_y"] = yc
+            diag["base_name"] = _bn
+            return None, diag
+    return None, diag
+
+
+def _verify_tf_dest_dynamic(tf_id, tx, ty):
+    """用动态读取核验目的地是否为 (tx,ty)。返回 (是否精确一致, 实际值或None)。"""
+    d, diag = _read_tf_dest_dynamic(tf_id)
+    if d is None:
+        return False, None
+    return (int(d[0]) == int(tx) and int(d[1]) == int(ty)), d
+
+
+def _verify_tf_dest(tf_id, tx, ty):
+    """回读编队列表的目的地列，确认指令已生效。
+
+    ★纪律（教条 #46）★ 判据必须**精确相等**：
+      旧版 `abs(dx-tx)<=1` 的 ±1 容差把偏差洗成了"✓ 已确认"，第十二局据此
+      误判了整整一局。容差=0 才是核验。
+    ★纪律（教条 #49）★ 行定位必须**动态**：旧 `_read_tf_dest_from_list` 用写死的
+      ROW_YS + 行序表，既绑死剧本，也是"TF16 读出 TF17 目标"的根源。
+      读不出本人行 → 直接判失败（**宁可失败也不读错行**）。
+    """
+    d, _diag = _read_tf_dest_dynamic(tf_id)
+    if d is None:
+        return False
+    return int(d[0]) == int(tx) and int(d[1]) == int(ty)
+
+AGENT_DIR = "/root/.hermes/profiles/witp/witp-agent"
+if AGENT_DIR not in sys.path:
+    sys.path.insert(0, AGENT_DIR)
+
+from lib.executor import (
+    vnc_click,
+    vnc_key,
+    focus_map,
+    close_summaries,
+    end_turn,
+    set_cap_percent,
+    open_tf_list,
+    escape_to_main,
+    get_window_offset
+)
+
+# ★ 地面部队战斗命令（补齐命令面缺口）★
+sys.path.insert(0, "/root/.hermes/workspace")
+try:
+    from witp_ground_orders import cmd_ground_order
+    _GROUND_ORDERS = True
+except Exception as _ge:
+    _GROUND_ORDERS = False
+    _GROUND_ORDERS_ERR = str(_ge)
+
+# ★ 己方舰队状态（补上「舰队损伤不可见」的感知缺口）★
+try:
+    from witp_fleet_status import cmd_fleet_status
+    _FLEET_STATUS = True
+except Exception as _fse:
+    _FLEET_STATUS = False
+    _FLEET_STATUS_ERR = str(_fse)
+
+# ★ 侦察态势检查（补上「没有侦察链」的致命缺口）★
+try:
+    from witp_recon_status import cmd_recon_status
+    _RECON_STATUS = True
+except Exception as _rse:
+    _RECON_STATUS = False
+    _RECON_STATUS_ERR = str(_rse)
+
+# 参谋管理 + 回写闭环
+sys.path.insert(0, "/root/.hermes/profiles/witp/witp-agent")
+try:
+    from witp_cmd_staffops import (
+        staff_check, staff_fix, staff_resync,
+        record_turn, close_game, skb_add_doctrine, skb_status,
+        set_current_game, new_game,
+    )
+    _STAFFOPS = True
+except Exception as _e:
+    _STAFFOPS = False
+    _STAFFOPS_ERR = str(_e)
+
+def cmd_staff(args):
+    """指挥参谋部：默认出建议书；--saves 枚举存档；--save 指定存档；--check 体检；--fix 修复；--resync 强制重读"""
+    staff_script = os.path.join(AGENT_DIR, "witp_staff.py")
+
+    # ── 枚举可用存档（让指挥官知道能指定哪些） ──
+    if getattr(args, "saves", False):
+        subprocess.run([_VENV_PY, staff_script, "brief", "--saves"])
+        return
+
+    # ── 指定存档：主动指挥参谋部去解析这一份 ──
+    if getattr(args, "save", None):
+        cmd = [_VENV_PY, staff_script, "brief", "--save", str(args.save)]
+        if getattr(args, "json", False):
+            cmd.append("--json")
+        print(f"[witp-cmd] 指挥参谋部解析指定存档：{args.save}")
+        rc = subprocess.run(cmd).returncode
+        sys.exit(rc)
+
+    if not _STAFFOPS:
+        print(f"[witp-cmd] 参谋管理模块加载失败: {_STAFFOPS_ERR}")
+        return
+    if getattr(args, "check", False):
+        healthy, _ = staff_check(verbose=True)
+        sys.exit(0 if healthy else 1)
+    if getattr(args, "fix", False):
+        ok, _ = staff_fix(verbose=True)
+        sys.exit(0 if ok else 1)
+    if getattr(args, "resync", False):
+        d = staff_resync(verbose=True)
+        sys.exit(0 if (d and d.get("ok")) else 1)
+
+    # 出建议书前先体检，不健康则明确告警（但不阻断，交由指挥官处置）
+    healthy, rep = staff_check(verbose=False)
+    if not healthy:
+        print("[witp-cmd] ⚠️ 参谋部体检未通过，建议书可能基于过期数据：")
+        for i in rep.get("issues", []):
+            print(f"         - {i}")
+        print("         → 修复命令： witp-cmd staff fix")
+        print()
+
+    # 默认强制读最新存档（第六局修复：不再让参谋读陈旧 state/ JSON）
+    # - 优先用 SAVE 目录最新 .pws；--no-scraper 可显式关闭
+    staff_script = os.path.join(AGENT_DIR, "witp_staff.py")
+    cmd = [_VENV_PY, staff_script, "brief"]
+    if args.json:
+        cmd.append("--json")
+    if getattr(args, "scraper", False) or not getattr(args, "no_scraper", False):
+        cmd.append("--scraper")
+    if getattr(args, "save", None):
+        cmd += ["--save", str(args.save)]
+    else:
+        # 自动指定最新存档（槽位 000 = Autosave 通常是结算后新状态）
+        newest = _newest_save_path()
+        if newest:
+            slot = os.path.basename(newest).replace("wpae", "").replace(".pws", "")
+            cmd += ["--save", slot]
+
+    if getattr(args, "model", None):
+        cmd += ["--model", str(args.model)]
+    if getattr(args, "fallbacks", None):
+        cmd += ["--fallbacks", str(args.fallbacks)]
+
+    subprocess.run(cmd)
+
+def cmd_model(args):
+    """参谋大模型管理：查看候选池 / 测试响应连通性 / 指定主模型与备用链"""
+    from witp_models import list_models_status, set_models
+    action = getattr(args, "model_action", "list") or "list"
+    if action == "list":
+        list_models_status(test=getattr(args, "test", False))
+    elif action == "test":
+        list_models_status(test=True)
+    elif action == "set":
+        primary = args.primary
+        fallbacks = [f.strip() for f in args.fallbacks.split(",") if f.strip()] if getattr(args, "fallbacks", None) else None
+        res = set_models(primary, fallbacks=fallbacks, primary_provider=getattr(args, "provider", None))
+        if res.get("ok"):
+            print(f"[witp-cmd] ✓ 参谋模型配置已持久化更新！")
+            print(f"  主模型: {res['primary']['model']} (Provider: {res['primary']['provider_id']})")
+            if res.get("fallbacks"):
+                print("  备用链 (顺序回退):")
+                for idx, fb in enumerate(res["fallbacks"], 1):
+                    print(f"    {idx}. {fb['model']} (Provider: {fb['provider_id']})")
+        else:
+            print(f"[witp-cmd] ❌ 设置失败: {res.get('error')}")
+
+def _newest_save_path():
+    """返回当前正在玩的活跃存档路径（优先 wpae000.pws Autosave，无则最新 .pws）。"""
+    import glob as _glob
+    auto_pws = "/root/.wine-witp/drive_c/1108r9/War in the Pacific Admiral's Edition/SAVE/wpae000.pws"
+    if os.path.exists(auto_pws):
+        return auto_pws
+    saves = _glob.glob("/root/.wine-witp/drive_c/1108r9/War in the Pacific Admiral's Edition/SAVE/*.pws")
+    if not saves:
+        return None
+    return max(saves, key=os.path.getmtime)
+
+def cmd_launch(args):
+    """自动启动/重开珊瑚海战役并就位第 1 回合战术地图"""
+    print("[witp-cmd] 正在执行珊瑚海战役全自动启动流程...")
+    launch_script = os.path.join(AGENT_DIR, "auto_start_coral_sea.py")
+    subprocess.run([_VENV_PY, launch_script])
+
+def cmd_set_dest(args):
+    """设置编队目的地。
+
+    ★2026-10-03 真实机制（逐帧取证，推翻此前多版错误前提）★
+      ① T 开编队列表 → 双击目标行 → 编队详情面板。
+      ② 点 `Set TF Destination` 标题左侧箭头（≈ Destination 词左边界 −45px）
+         → ★面板立即关闭★（ui_state='map'），进入选格模式。
+      ③ 在整张地图任意像素点击 → 目的地设定，★面板自动重开★显示新目的地。
+         ⇒ **选格时全屏可点，不存在面板遮挡**（此前"遮挡带"结论已作废）。
+      ④ 核验：面板回读 `Hex: x,y`（基地格显示 `<基地名>-x,y`，无 Hex 前缀）。
+      最终权威仍是结算后读层 target_x/target_y。
+    实现见 lib/setdest14.py（视野内）/ setdest13.py（同，无滚动）。
+    """
+    try:
+        import sys as _s
+        _s.path.insert(0, "/root/.hermes/profiles/witp/witp-agent")
+        try:
+            from lib import setdest14 as _sd   # ★2026-10-03 定稿：视野内单探针+已知比例；
+        except Exception:                       #   视野外走边缘滚动（2.5 格/秒）
+            from lib import setdest13 as _sd
+    except Exception as _e:
+        print(f"[witp-cmd] ❌ set-dest 模块加载失败: {_e}")
+        sys.exit(1)
+    ok, last = _sd.set_tf_dest(args.tf_id, args.hex_x, args.hex_y,
+                               deadline=float(getattr(args, "deadline", 140) or 140))
+    if ok:
+        print(f"[witp-cmd] ✓ 编队 {args.tf_id} 目的地 = {last}"
+              f"（面板回读确认；最终以结算后读层核验）")
+    else:
+        print(f"[witp-cmd] ❌ 编队 {args.tf_id} 未能确认目的地 = ({args.hex_x},{args.hex_y})"
+              f"（末次面板读数 {last}）—— 以结算后读层为准。")
+        sys.exit(1)
+
+
+# ★2026-09-24 新增：CAP 高度控制（实测标定）★
+#   航空队详情内 "Current Altitude" 行 y≈372，控件行 y≈387。
+#   逐像素扫描实测的按钮语义（Δ 为点击后高度变化）：
+#     x=647 → 直接设为最低 100 ft        x=667 → 设为 1000 ft
+#     x=732 → +1000 ft                   x=752 → +5000 ft
+#     x=772 → 直接设为最高（机型上限）
+ALT_Y = 387
+ALT_MIN, ALT_SET1K, ALT_P1K, ALT_P5K, ALT_MAX = 647, 667, 732, 752, 772
+
+
+def _read_alt():
+    """读取详情面板 Current Altitude 数值。
+
+    ★2026-09-24 校准★ 整行宽裁剪会让 OCR 把 6 读成 S（实测 "6000"→"S000"）。
+    改为**只裁数值本体** (720,364)-(768,388) 并放大 10 倍 + 数字白名单，
+    实测 "6000" 稳定识别。
+    """
+    from PIL import Image, ImageOps
+    _shot_to("/tmp/_alt_read.png")
+    im = Image.open("/tmp/_alt_read.png").crop((720, 364, 768, 388))
+    im = ImageOps.autocontrast(ImageOps.grayscale(im)).resize((im.width * 10, im.height * 10), Image.LANCZOS)
+    im.save("/tmp/_alt_read_z.png")
+    for _a in ("- --psm 7 -c tessedit_char_whitelist=0123456789", "- --psm 7", "- --psm 8", "- --psm 13"):
+        t = _ocr("/tmp/_alt_read_z.png", _a)
+        m = re.search(r"\d{3,5}", t)
+        if m:
+            return int(m.group(0))
+    return None
+
+
+def _set_altitude(target):
+    """把当前打开的中队详情中的 CAP 高度设为目标英尺。
+
+    实测按钮语义见上；实现为「归最低 → 置 1000 → 用 +5000/+1000 步进逼近」，
+    每步都读回校验，读失败则重试（不盲加，避免超调）。
+    """
+    target = int(target)
+    vnc_click(ALT_MIN, ALT_Y, "click"); time.sleep(0.9)
+    if target <= 100:
+        return _read_alt()
+    vnc_click(ALT_SET1K, ALT_Y, "click"); time.sleep(0.9)
+    for _ in range(40):
+        cur = _read_alt()
+        if cur is None:
+            time.sleep(0.5)
+            continue
+        if cur == target:
+            return cur
+        gap = target - cur
+        if gap >= 5000:
+            vnc_click(ALT_P5K, ALT_Y, "click")
+        elif gap >= 1000:
+            vnc_click(ALT_P1K, ALT_Y, "click")
+        else:
+            return cur
+        time.sleep(0.9)
+    return _read_alt()
+
+
+def _find_cap_row_y():
+    """在航空队详情屏右侧「Patrol levels」区定位 'CAP' 行的 y 中心。
+
+    ★2026-10-14 新增（修 CAP 行 y 写死缺陷）★
+      详情屏该区各行 y 随中队装备/机型行数浮动（实测同一局不同中队 CAP 行
+      可落在 y≈303 或 y≈316）。写死 CAP_Y=303 会对部分中队点空。
+    ★两级定位★
+      ① 主：OCR 面板找 'LRCAP' 词（CAP 行恒在其上 14px；LRCAP 字形更易读）；
+      ② 备：OCR 找 'CAP'/'CRP' 等词。
+      找不到返回 None（调用方回退 303）。
+    """
+    from PIL import Image, ImageOps
+    import csv as _csv
+    _shot_to("/tmp/_caprow.png")
+    try:
+        im = Image.open("/tmp/_caprow.png").convert("RGB")
+    except Exception:
+        return None
+    box = (600, 280, 900, 440)          # Patrol levels 区
+    c = ImageOps.autocontrast(ImageOps.grayscale(im.crop(box)))
+    c = c.resize((c.width * 5, c.height * 5), Image.LANCZOS)
+    c.save("/tmp/_caprow_t.png")
+    subprocess.run("tesseract /tmp/_caprow_t.png /tmp/_caprow --psm 6 tsv 2>/dev/null", shell=True)
+    try:
+        rows = list(_csv.DictReader(open("/tmp/_caprow.tsv"), delimiter="\t", quoting=_csv.QUOTE_NONE))
+    except Exception:
+        return None
+    # ① LRCAP 锚点
+    for r in rows:
+        tu = (r.get("text") or "").strip().upper()
+        if "LRCAP" in tu or "LRC" in tu or "RCA" in tu:
+            yc = int(r["top"]) / 5.0 + int(r["height"]) / 10.0 + box[1]
+            return int(round(yc)) - 14
+    # ② CAP 词
+    for r in rows:
+        tu = (r.get("text") or "").strip().upper()
+        if tu in ("CAP", "CRP", "GAP", "CEAP"):
+            yc = int(r["top"]) / 5.0 + int(r["height"]) / 10.0 + box[1]
+            return int(round(yc))
+    return None
+
+
+def _read_cap_pct():
+    """读取航空队详情面板 CAP 行的百分比数值。
+
+    ★2026-10-14 修★ 原读数窗口写死 (704,297)-(745,311)（实测那是 ASW 行），
+      改为**跟随 _find_cap_row_y() 定位的行**读同一行的数值区。
+    """
+    from PIL import Image, ImageOps
+    _shot_to("/tmp/_capread.png")
+    try:
+        im = Image.open("/tmp/_capread.png").convert("RGB")
+    except Exception:
+        return None
+    yc = _find_cap_row_y() or 303
+    # ★2026-10-15 修（读数窗口按实测重标）★
+    #   实测 EI-1 详情屏：CAP 行 y=298、值「80%/100%」在 x≈719、
+    #   百分比符号紧随其后（x≈735）。原窗口 (725,±6) 落在 % 号右侧空白，
+    #   故常读成空 → 被误判「没设上」。
+    #   新窗口覆盖 705..765，含数字与 %，显著提高读出率。
+    im2 = im.crop((705, yc - 7, 765, yc + 7))
+    im2 = ImageOps.autocontrast(ImageOps.grayscale(im2)).resize((im2.width * 10, im2.height * 10),
+                                                                Image.LANCZOS)
+    im2.save("/tmp/_capread_z.png")
+    txt = _ocr("/tmp/_capread_z.png", "- --psm 7 -c tessedit_char_whitelist=0123456789")
+    m = re.search(r"\d{1,3}", txt)
+    return int(m.group(0)) if m else None
+
+
+def _is_carrier_group(ag_id: str) -> bool:
+    """判断航空队是否**舰载**（零硬编码，阵营无关）。
+
+    ★依据读层权威数据：航母（CV/CVL/CVE）记录的 `airgroups` 子名单。
+      任一名字与之匹配即判为舰载。这样盟军（VF-/VB-…）与日军
+      （EI-1 Daitai / EIII-1 Chutai …）都不需要写死前缀。
+
+    匹配规则：读层名字与查询名做「全等」或「双向 startswith」归一化比较
+    （读层名有时带尾随空格/编号后缀）。
+    """
+    def _norm(s):
+        return re.sub(r"[^A-Z0-9]", "", str(s).upper())
+
+    t = _norm(ag_id)
+    if not t:
+        return False
+    try:
+        with open("/root/.hermes/workspace/witp-reader/state/ships.json",
+                  encoding="utf-8") as f:
+            ships = json.load(f)
+        ships = ships if isinstance(ships, list) else ships.get("ships", [])
+    except Exception:
+        return False
+    for s in ships:
+        if str(s.get("ship_class_type_name")) not in ("CV", "CVL", "CVE"):
+            continue
+        for g in (s.get("airgroups") or []):
+            n = _norm(g.get("name"))
+            if n and (n == t or n.startswith(t) or t.startswith(n)):
+                return True
+    return False
+
+
+def _cap_from_state(ag_id: str):
+    """★2026-10-15 新增★ 从**存档读层** airgroups.json 读该中队的 percent_cap。
+
+    动机：详情屏 OCR 回读（`_read_cap_pct`）在本环境经常读不出 →
+    误报"CAP 未设上"。教条明确「UI 回读只是过程证据，唯一最终权威是读层」，
+    故这里给 set-cap 一个可靠的权威判据来源。
+
+    匹配：读层名字与查询名做归一化（去非字母数字、大写）后全等或双向 startswith。
+    """
+    try:
+        with open("/root/.hermes/workspace/witp-reader/state/airgroups.json",
+                  encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    ags = data if isinstance(data, list) else data.get("airgroups", [])
+
+    def _norm(s):
+        return re.sub(r"[^A-Z0-9]", "", str(s).upper())
+
+    t = _norm(ag_id)
+    if not t:
+        return None
+    for g in ags:
+        n = _norm(g.get("name"))
+        if n and (n == t or n.startswith(t) or t.startswith(n)):
+            v = g.get("percent_cap")
+            return int(v) if v is not None else None
+    return None
+
+
+def cmd_set_cap(args):
+    """设置航空队 CAP 百分比（舰载 N / 陆基 A 自适应）。
+
+    ★2026-09-24 修复（三项致命错误）★
+      1) 开详情方式：N 列表 = **单击图标列 x=190**；A 列表 = 双击 x=215。
+         旧代码对两者统一用双击 x=215 → 舰载中队全部打不开详情，CAP 从未真正设置成功。
+      2) CAP 按钮语义（实测）：x=651 直接归零 / x=671 每次 −10 / x=746 每次 +10 / x=767 直接设 100。
+         旧代码用 x=766 连点 pct//20 次 → 数值完全错。
+      3) 新增读回核验：改完立刻重读 CAP 数值，与目标不符则告警。
+    """
+    ag_id = args.ag_id
+    pct = int(args.percent)
+    # ★2026-09-29 修复（换阵营暴露）★ 原判据写死盟军中队名前缀
+    #   `["VF-","VB-","VS-","VT-","VCS-"]` —— 日军舰载中队叫 `EI-1 Daitai`
+    #   /`EIII-1 Chutai`，**一个都不匹配** → 被误判为陆基 → 去陆基列表 (A) 找
+    #   → 必然"定位失败"，而调用方（set-cap-all）仍把它记成 done（假成功）。
+    #   改为**读层权威判据**：凡出现在我方航母 `airgroups` 名单里的中队即舰载，
+    #   与阵营命名无关（零硬编码）。
+    is_naval = _is_carrier_group(ag_id)
+    list_key = "n" if is_naval else "a"
+    # ★2026-10-14 新增 --list 强制指定★ 读层 airgroups.json 有时**漏掉某些舰载机队**
+    #   （实测只导出 Shokaku 的 EI-*，漏掉 Zuikaku/Shoho 的 EII/EIII），
+    #   导致 _is_carrier_group 判成陆基 → 去 A 列表找不到。允许显式指定列表。
+    if getattr(args, "list", None):
+        list_key = args.list
+        is_naval = (list_key == "n")
+    list_name = "舰载机列表 (N)" if list_key == "n" else "陆基列表 (A)"
+    print(f"[witp-cmd] 执行指令：将中队 {ag_id} CAP 设定为 {pct}%（{list_name}）...")
+
+    focus_map()
+    vnc_key(list_key)
+    time.sleep(3.0)
+
+    row_y = getattr(args, "row", None) or _find_airgroup_row(ag_id, list_key)
+    if row_y is None:
+        print(f"[witp-cmd] ❌ 未能在 {list_name} 定位中队 {ag_id}！中止操作。")
+        vnc_key("escape")
+        return
+
+    how = "单击 x=190" if is_naval else "双击 x=215"
+    print(f"[witp-cmd] 打开中队详情 (行 y={row_y}，{how})...")
+    if is_naval:
+        vnc_click(190, row_y, "click")
+    else:
+        vnc_click(215, row_y, "dblclick")
+    time.sleep(3.0)
+
+    before = _read_cap_pct()
+    print(f"[witp-cmd] 当前 CAP = {before}")
+
+    # ★★2026-10-15 修（--row 只作用于列表行、不作用于 CAP 滑块行）★★
+    #   实测：`--row 321`（列表行）能让详情屏正确打开，但 CAP 滑块行仍回退到
+    #   写死的 303 ⇒ 点击落在错误行 ⇒ 设不上（EI-1 反复失败的第二个原因）。
+    #   详情屏「Patrol levels」各行与**列表行**存在稳定偏移：实测
+    #     列表 y=321 → CAP 行 y≈335（偏移 +14×2=+28~+42 视面板行数）。
+    #   由于偏量不稳定，这里按 **列表行 + 42 试算**，并由 _find_cap_row_y()
+    #   的 OCR 结果优先；两者都不行才回退 303。
+    #   另新增 --cap-row 供直接指定（最可靠）。
+    cap_row_override = getattr(args, "cap_row", None)
+    if cap_row_override:
+        CAP_Y = int(cap_row_override)
+        print(f"[witp-cmd] CAP 行 y = {CAP_Y}（--cap-row 显式指定）")
+    else:
+        _ocr_cap = _find_cap_row_y()
+        if _ocr_cap:
+            CAP_Y = _ocr_cap
+            print(f"[witp-cmd] CAP 行 y = {CAP_Y}（OCR 定位）")
+        elif getattr(args, "row", None):
+            CAP_Y = int(args.row) + 42
+            print(f"[witp-cmd] CAP 行 y = {CAP_Y}（由列表行 {args.row} + 42 试算）")
+        else:
+            CAP_Y = 303
+            print(f"[witp-cmd] CAP 行 y = {CAP_Y}（回退默认值）")
+
+    # ★★2026-10-14 修（CAP 行 y 写死致 Shokaku 组设不上）★★
+    #   旧实现 CAP_Y = 303 是**写死值**，但详情屏「Patrol levels」区各行 y 会随
+    #   该中队装备/机型行数浮动（实测同一局 Zuikaku 战斗机 CAP 行在 y≈323，
+    #   而写死的 303 是另一中队的行位）⇒ 对 y 不同的中队点 303 会点到 ASW 行，
+    #   CAP 永远设不上（这正是 game-054 里 EI-1/EII-1 反复失败、导致 Zuikaku
+    #   被击沉的真因）。
+    #   ⇒ 改为 **OCR 动态定位 CAP 行**（见上方 2026-10-15 块，含 --cap-row 与
+    #      「列表行 +42」试算两条兜底）。此处不再重复赋值。
+    if pct <= 0:
+        vnc_click(651, CAP_Y, "click"); time.sleep(0.6)
+    elif pct >= 100:
+        vnc_click(767, CAP_Y, "click"); time.sleep(0.6)
+    else:
+        # ★2026-09-29 修复★ 确定性路径：先「归零」(x=651)，再从 0 逐次 +10 到目标。
+        vnc_click(651, CAP_Y, "click"); time.sleep(0.6)
+        base = _read_cap_pct()
+        if base is not None and base != 0:
+            print(f"[witp-cmd] ⚠️ 归零后读回 {base}（预期 0）—— 继续按差值步进")
+        steps = int(round(pct / 10.0))
+        for _ in range(steps):
+            vnc_click(746, CAP_Y, "click"); time.sleep(0.35)
+    time.sleep(1.0)
+
+    # ★2026-09-24 新增★ CAP 分层高度（--alt）：详情面板保持打开时设置
+    alt_got = None
+    if getattr(args, "alt", None):
+        alt_got = _set_altitude(args.alt)
+        print(f"[witp-cmd] CAP 高度 → 读回 {alt_got} ft（目标 {args.alt} ft）")
+
+    after = _read_cap_pct()
+    vnc_key("escape")
+    time.sleep(1.5)
+
+    # ★2026-10-15 修（CAP 长期"设上了却报失败"的真因）★
+    #   `_read_cap_pct()` 是**详情屏 OCR**，本环境下经常读不出（返回 None）
+    #   → `ok_cap=False` → 打印"未达目标，不视为成功"。
+    #   但指令其实**已经下发且生效**（实测 game-059：报 3 个中队全失败，
+    #   存档读层 percent_cap 却是 80/80/80）。
+    #   这与教条一致：**UI 回读只是过程证据，唯一最终权威是结算后读层**。
+    #   ⇒ OCR 失败时改查存档读层的 percent_cap 作为权威判据。
+    authoritative = None
+    if after is None:
+        authoritative = _cap_from_state(ag_id)
+        if authoritative is not None:
+            after = authoritative
+
+    # ★2026-09-29 修复★ 原判据 `abs(after - pct) <= 10` **带 ±10 容差** ——
+    #   正是教条禁止的「判据带容差」：实测把 CAP=55（目标 60）报成"✓ 成功"。
+    #   改为**精确相等**：必须 after == pct 才算成功，否则明确报 FAILED。
+    ok_cap = (after is not None and after == pct)
+    ok_alt = (not getattr(args, "alt", None)) or (alt_got is not None and alt_got == args.alt)
+    if ok_cap and ok_alt:
+        src = "存档读层" if authoritative is not None else "详情屏回读"
+        msg = f"✓ 中队 {ag_id} CAP = {after}%（目标 {pct}%，判据来源={src}）"
+        if getattr(args, "alt", None):
+            msg += f"，高度 = {alt_got} ft（目标 {args.alt} ft）"
+        print(f"[witp-cmd] {msg} —— 确认生效。")
+    else:
+        print(f"[witp-cmd] ❌ 中队 {ag_id} CAP 读回 {after}%（目标 {pct}%）"
+              f"、高度读回 {alt_got}（目标 {getattr(args,'alt',None)}）"
+              f"—— **未达目标，不视为成功**。")
+        # ★2026-10-15★ 指令已下发、但拿不到任何回读时，不得静默判死：
+        #   提示上层用存档读层复核（唯一权威），而不是当作"没设上"重来。
+        if after is None:
+            print("[witp-cmd] ⚠ 注意：本次**未能取得任何回读**（详情屏 OCR 失败）。"
+                  "指令已下发；请以存档读层 airgroups.json 的 percent_cap 为唯一权威判据，"
+                  "不要据此推断'没设上'。")
+
+
+def cmd_set_cap_all(args):
+    """★2026-09-29 新增★ 批量设置：按前缀枚举所有同级中队。
+
+    动机：第十八局只设了 VF-5（约克敦），漏设 VF-2（列克星敦）→ 列克星敦维持
+    剧本默认 30% CAP，被 3 条鱼雷重创。⇒ 航母 CAP 必须**逐中队全部设定**，
+    不能只设当前选中编队的那一艘。
+
+    用法: witp-cmd set-cap-all VF 60        # 所有 VF-* 中队
+          witp-cmd set-cap-all VF,VCS 60    # 多个前缀
+    枚举来源：读层 airgroups.json（权威），不靠界面扫描。
+    """
+    prefixes = [p.strip().upper() for p in args.prefix.split(",") if p.strip()]
+    pct = int(args.percent)
+    state = "/root/.hermes/workspace/witp-reader/state/airgroups.json"
+    try:
+        with open(state, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"[witp-cmd] ❌ 读层 airgroups.json 不可用：{e}")
+        return
+    groups = raw if isinstance(raw, list) else (
+        raw.get("air_groups") or raw.get("data") or [])
+    targets = []
+    for r in groups:
+        name = str(r.get("name") or "")
+        up = name.upper()
+        if any(up.startswith(p) for p in prefixes):
+            targets.append(name)
+    # 去重保序
+    seen = set()
+    targets = [t for t in targets if not (t in seen or seen.add(t))]
+    if not targets:
+        print(f"[witp-cmd] ❌ 读层找不到前缀 {prefixes} 的中队")
+        return
+    print(f"[witp-cmd] 批量设 CAP：{len(targets)} 个中队 → {pct}%")
+    print(f"           目标：{targets}")
+    results = {}
+    for t in targets:
+        ns = argparse.Namespace(ag_id=t, percent=pct,
+                                row=None, alt=getattr(args, "alt", None))
+        try:
+            # ★2026-09-29 修复★ 原先无条件记 "done"，即使 cmd_set_cap 内部
+            #   "定位失败→return" 也照样算成功 → **假成功**（实测 2/4 中队
+            #   根本没设，汇总却报 4/4 done）。现改为：
+            #   捕获 stdout，检出失败标志词即记 failed，绝不静默当成功。
+            import io
+            import contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cmd_set_cap(ns)
+            out = buf.getvalue()
+            print(out, end="")
+            if ("❌" in out) or ("未能在" in out) or ("中止" in out):
+                results[t] = "FAILED"
+            else:
+                results[t] = "done"
+        except Exception as e:
+            results[t] = f"err:{e}"
+    nfail = sum(1 for v in results.values() if v != "done")
+    print(f"\n[witp-cmd] 批量结果：{results}")
+    if nfail:
+        print(f"[witp-cmd] ⚠️ 有 {nfail}/{len(results)} 个中队**未成功**"
+              f"（见上方 ❌ 行）——不得视为全部完成。")
+    print(f"[witp-cmd] ★ 最终判据仍为结算后读层 airgroups.json 的 percent_cap"
+          f"（指令层读回不算数）。")
+
+# ============================================================================
+# set-search：对海搜索 / 反潜搜索比例
+#   指挥官指正（2026-09-25）：十二局从未发现敌航母 = 侦察策略有缺陷；
+#   根因之一是「搜索从未成为可执行命令」（recon_guidance 只是散文）。
+#
+#   ⚠️⚠️ 航空队详情面板的行坐标**会随面板内容位移**——把 Search 设为非 0 会露出
+#      搜索弧控件（Start OGC / End OGC / Reset arc），Search/Train/Rest 整块下移；
+#      同一面板在不同状态下**行序甚至不同**。故**严禁硬编码 y**，
+#      一律在运行时用 OCR 定位「Patrol levels」区块内的目标行，再像素扫描定位按钮。
+# ============================================================================
+_PANEL_X0, _PANEL_X1 = 645, 900
+# ★2026-10-01 修（换阵营+换列表暴露的「标定写死」缺陷）★
+#   原常量 300..465 是按 **N 列表（舰载）** 详情屏标定的；
+#   实测 **A 列表（陆基）** 详情屏的搜索控制区整体上移到 y≈160..210
+#   （关键字 Naval/ASW/Patrol 实测出现在 (668,166)/(667,204)/(802,197)）。
+#   写死一个 y 带必然漏掉另一侧 ⇒ 改为**覆盖整个右侧控制区**，由关键字自适应命中；
+#   取词框时用「与关键字同一行的按钮」而非固定行号。
+_PANEL_Y0, _PANEL_Y1 = 120, 560
+
+
+def _panel_tokens():
+    """OCR 详情面板右侧，返回 [(row_y, x_left, text)]（游戏坐标）。"""
+    from PIL import Image, ImageOps
+    import csv as _csv
+    _shot_to("/tmp/_panel.png")
+    im = Image.open("/tmp/_panel.png").crop((_PANEL_X0, _PANEL_Y0, _PANEL_X1, _PANEL_Y1))
+    im = ImageOps.autocontrast(ImageOps.grayscale(im)).resize((im.width * 4, im.height * 4), Image.LANCZOS)
+    im.save("/tmp/_panel_z.png")
+    subprocess.run("tesseract /tmp/_panel_z.png /tmp/_panel_z --psm 6 tsv 2>/dev/null", shell=True)
+    out = []
+    try:
+        with open("/tmp/_panel_z.tsv") as f:
+            for r in _csv.DictReader(f, delimiter="\t"):
+                t = (r.get("text") or "").strip()
+                if not t:
+                    continue
+                try:
+                    conf = float(r.get("conf") or -1)
+                except Exception:
+                    conf = -1
+                if conf < 20:
+                    continue
+                y = _PANEL_Y0 + int(int(r["top"]) // 4) + 6
+                x = _PANEL_X0 + int(int(r["left"]) // 4)
+                out.append((y, x, t))
+    except Exception:
+        pass
+    return out
+
+
+def _locate_panel_row(label):
+    """按标签 (Search / ASW / Train / Rest) 定位行 y；容忍 OCR 噪声（如 'Search5o'）。"""
+    key = label.lower().replace(" ", "")
+    toks = _panel_tokens()
+    cand = [t for t in toks if key in t[2].lower().replace(" ", "")]
+    if not cand:
+        return None
+    cand.sort(key=lambda t: t[0])
+    return cand[-1][0]          # 取最下方者（Patrol levels 区块位于面板下半部）
+
+
+def _row_button_xs(y):
+    """在行带内定位 4 个按钮的 x。
+
+    ⚠️ 不能用「最右两簇」——当该行附近出现搜索弧文字（Start OGC/End OGC）时，
+    行内会多出右侧文字簇，导致把非按钮当按钮（实测把 VP-11 的 +100 点错）。
+    左侧两按钮位置稳定（实测恒为 652/671），故**以左对为基准、按实测偏移推出右对**：
+      →100 = 左对首项 + 111、 +10 = 左对首项 + 90   （652→763、652→742）
+    """
+    from PIL import Image
+    _shot_to("/tmp/_row.png")
+    im = Image.open("/tmp/_row.png").convert("L")
+    px = im.load()
+    y0, y1 = max(0, y - 7), min(im.height, y + 7)
+    runs, cur = [], None
+    for x in range(_PANEL_X0, _PANEL_X1):
+        n = sum(1 for yy in range(y0, y1) if px[x, yy] > 140)
+        if n >= 1:
+            if cur and x - cur[1] <= 2:
+                cur[1] = x
+            else:
+                if cur:
+                    runs.append(cur)
+                cur = [x, x]
+    if cur:
+        runs.append(cur)
+    if len(runs) < 2:
+        return None
+    mid = lambda r: (r[0] + r[1]) // 2
+    # ★2026-10-01 修（换列表暴露的「偏移写死」缺陷）★
+    #   原按左对首项 +90/+111 推右对 —— 那是 **N 列表（舰载）** 的标定
+    #   （实测 652/671/742/763）。**A 列表（陆基）** 实测为 653/697/743/764，
+    #   偏移不同 ⇒ 陆基中队「能设上但读回 None」，误报未确认。
+    #   改为：若行内检出 ≥4 个亮度簇，**直接取四簇**；否则回落偏移法（兼容舰载屏）。
+    # ★2026-10-04 修（set-search 值卡在 50/20 上不去 100 的真因）★
+    #   原「检出 ≥4 簇就直接取四簇」是错的：陆基屏实测簇为 652/671/700/722，
+    #   其中 **700/722 不是 +10/+100 按钮**。真按钮在 zero+90 / zero+111
+    #   （两种列表实测一致：N 列表 652→742/763，A 列表 653→743/764）。
+    #   取错按钮 ⇒ 点「+100」实际点到别处 ⇒ 值停在 50/20 上不去。
+    #   改为：**恒定按 zero 推 plus/full**，簇只用来定 zero / minus。
+    zx = mid(runs[0])
+    minus = mid(runs[1])
+    return {"zero": zx, "minus": minus,
+            "plus": zx + 90, "full": zx + 111,
+            "clusters": runs}
+
+
+def _read_row_pct(y, buttons):
+    """读取该行数值：取「标签簇之后、+10 按钮之前」的文字簇。
+
+    ★2026-09-26 加固★ 原实现有两个毛病，导致 set-search 长期"读回 None → 判未确认"：
+      ①裁剪起于 inner 簇首，实测会把标签尾字一并裁进来（裁出 `search 10C`）；
+      ②OCR 把 **C 读成 0 的反向**（"100"→"10C"），而原实现只取 `\\d{1,3}` 首段，
+        会得到 "10" 甚至拿不到，于是明明设成功也报"未确认"。
+      改为：按按钮基准定死数值区（minus+12 .. plus-2）、数字白名单、
+      再把 C/O→0、S→5、I/L→1、B→8、G→6 归一后取全部数字。
+      （实测 VS-5 的 Search 经视觉确认为 100，本函数修好后才读得出。）
+    """
+    from PIL import Image, ImageOps
+    if not buttons:
+        return None
+    x0 = buttons["minus"] + 12
+    x1 = buttons["plus"] - 2
+    # ★2026-10-04 修（set-search 长期"设上了却读回 2/3 判未确认"的真因）★
+    #   陆基屏（A 列表）实测簇识别会多出右侧文字簇，把非按钮当按钮
+    #   （实测簇 = 652/671/700/725），于是读数窗口只剩 683..698 共 15px，
+    #   OCR 必然读出垃圾数字（2、3）。窗口过窄即判为簇识别有误，
+    #   回落到按 zero 按钮推的基准几何（实测两种列表的数值区都在 zero+30..zero+95）。
+    if x1 - x0 < 25:
+        z = buttons.get("zero", 652)
+        x0, x1 = z + 30, z + 95
+    if x1 - x0 < 8:
+        return None
+    _shot_to("/tmp/_rv.png")
+    im = Image.open("/tmp/_rv.png").crop((x0, y - 7, x1, y + 7))
+    im = ImageOps.autocontrast(ImageOps.grayscale(im)).resize((im.width * 10, im.height * 10), Image.LANCZOS)
+    im.save("/tmp/_rv_z.png")
+    raw = _ocr("/tmp/_rv_z.png", "- --psm 7 -c tessedit_char_whitelist=0123456789COoSsIlLBG")
+    t = raw.upper().replace("C", "0").replace("O", "0").replace("S", "5") \
+                 .replace("I", "1").replace("L", "1").replace("B", "8").replace("G", "6")
+    digits = re.sub(r"\D", "", t)
+    if not digits:
+        return None
+    v = int(digits)
+    return v if 0 <= v <= 100 else None
+
+
+def _panel_is_open(toks=None):
+    """判定航空队详情面板是否已打开：用 Patrol levels 区块的行名做多关键字判定。
+    ⚠️ 不要只认 'Patrol levels' 标签——它是黄字，常被 TSV 置信度过滤掉（实测踩坑）。"""
+    toks = toks if toks is not None else _panel_tokens()
+    blob = " ".join(t[2].lower().replace(" ", "") for t in toks)
+    return sum(k in blob for k in ("search", "asw", "train", "rest", "arc")) >= 2
+
+
+def _open_ag_detail(ag_id, list_key, row_override=None, list_already_open=False):
+    """打开航空队详情；返回 (是否成功, 行 y)。N 列表单击 x=190，A 列表单击 x=200。
+    ⚠️ 清单行的 y 在两次测量间会有 ±6px 抖动，故对给定行做邻近重试。
+    ★2026-10-04 修①★ 重试候选原为 ±(6,6,12,12,3,3)px，最大偏 12px。
+      行高仅 14px，偏 12px 就点到**相邻行**（实测 VS-2 从 427 偏到 341，
+      跨了 6 行 ⇒ 改错部队）。收窄为 ±(2,4,6)，最大不超半个行高。
+    ★2026-10-04 修②★ `list_already_open=True` 时**不再按 list_key**。
+      实测 --row-index 通道已在外部开过列表并据此数出行峰；这里再按一次
+      会把列表关掉再重开，行 y 随之平移（实测 427 → 341），
+      于是按行号的定位全部作废。"""
+    focus_map()
+    if not list_already_open:
+        vnc_key(list_key)
+        time.sleep(3.0)
+    else:
+        time.sleep(0.8)
+    row = row_override if row_override else _find_airgroup_row(ag_id, list_key)
+    if row is None:
+        vnc_key("escape")
+        return False, None
+    candidates = [row] + [row + d for d in (-2, 2, -4, 4, -6, 6)]
+    for r in candidates:
+        vnc_click(190 if list_key == "n" else 200, r, "click")
+        time.sleep(2.2)
+        toks = _panel_tokens()
+        if _panel_is_open(toks):
+            return True, r
+        vnc_click(215, r, "dblclick")       # 兜底：双击
+        time.sleep(2.2)
+        if _panel_is_open(_panel_tokens()):
+            return True, r
+    return False, row
+
+
+def cmd_set_search(args):
+    """设定航空队对海搜索 / 反潜搜索比例（含自纠正与读回核验）。"""
+    ag = args.ag_id
+    pct = max(0, min(100, int(args.percent)))
+    label = "ASW" if getattr(args, "asw", False) else "Search"
+    # ★2026-10-01 修（换阵营暴露的「写死单侧」缺陷）★
+    #   原判据写死盟军前缀 VF-/VB-/VS-/VT-/VCS- ⇒ 日军中队（`EI-1 Daitai`/
+    #   `Toko Ku T-1 Det`/`17th Ku T-1`）**全部被判为陆基**，但真正的问题在于：
+    #   日军舰载中队走 N 列表、陆基走 A 列表，写死前缀会让舰载中队去 A 列表找 → 打不开。
+    #   改为**读层权威判据** `_is_carrier_group`（看 stationed_on_ship_id）。
+    try:
+        from witp_ground_orders import _is_carrier_group as _icg2
+        is_naval = bool(_icg2(ag))
+    except Exception:
+        is_naval = any(k in ag.upper() for k in ["VF-", "VB-", "VS-", "VT-", "VCS-"])
+    list_key = "n" if is_naval else "a"
+    print(f"[witp-cmd] 设定 {ag} 的 {label} = {pct}%"
+          f"（{'舰载 N' if is_naval else '陆基 A'} 列表，运行时动态定位面板行）...")
+
+    # ★2026-10-04 新增：--row-index 纯像素行序通道（N 列表 OCR 认不出队名时唯一可用）★
+    row_override = getattr(args, "row", None)
+    ridx = getattr(args, "row_index", None)
+    if ridx is not None:
+        # ★必须先开对应列表再截图★：否则截到的是地图，行峰自然只有 0~1 个。
+        focus_map()
+        vnc_key(list_key)
+        time.sleep(3.0)
+        _shot_to("/tmp/_ri.png")
+        try:
+            from PIL import Image
+            from lib.executor import get_window_offset
+            _ox, _oy = get_window_offset()
+            _im = Image.open("/tmp/_ri.png").crop((_ox, _oy, _ox + 1024, _oy + 768))
+            _im.save("/tmp/_ri_w.png")
+            from lib.rowfind import find_rows
+            _rows = find_rows("/tmp/_ri_w.png")
+        except Exception as e:
+            _rows = []
+            print(f"[witp-cmd] ⚠️ 像素行定位失败: {e}")
+        print(f"[witp-cmd] · 像素行峰（共 {len(_rows)} 行）: "
+              f"{[y for y, _ in _rows]}")
+        if 0 <= ridx < len(_rows):
+            row_override = _rows[ridx][0]
+            print(f"[witp-cmd] · --row-index {ridx} → 行中心 y={row_override}")
+        else:
+            print(f"[witp-cmd] ❌ --row-index {ridx} 越界（共 {len(_rows)} 行），"
+                  f"中止（列表是否未打开？）。")
+            vnc_key("escape")
+            return
+
+    # ★2026-10-10 重写（set-search 长期失效的真因）★
+    #   旧路径：`_open_ag_detail(ag, ...)` 内部按 list_key 开列表 → `_find_airgroup_row`
+    #   定位 → 点行开详情屏。但随后 `_locate_panel_row(label)` 走 `_panel_tokens()`，
+    #   **实测读数恒为 None** —— 根因有二：
+    #     ① `_find_airgroup_row` 依赖当前屏幕**已经是列表屏**；旧路径若列表未开好
+    #        （半开/被 Esc 关掉）会返回错行（实测 VP-11 得 353，真值 377）；
+    #     ② 详情屏里 Search/ASW 行的按钮/数值区定位失败。
+    #   ⇒ 改用**与 set-mission 完全相同的已验证通道**：
+    #     focus → 点地图取焦 → 按 A/N 开列表 → `_find_airgroup_row` 定位 →
+    #     **单击该行**（x=192）开详情屏 → 再在详情屏定位并点击 Search 行按钮。
+    from lib.executor import vnc_key as _vk, vnc_click as _vc
+    row = None
+    for _try in range(3):
+        focus_map()
+        _vc(300, 500, "click"); time.sleep(0.6)
+        _vk(list_key)                  # 打开对应航空队列表
+        time.sleep(3.5)
+        row = row_override if row_override else _find_airgroup_row(ag, list_key)
+        if row is not None:
+            break
+        # 列表可能处于半开/未渲染态：Esc 清场后重开
+        _vk("escape"); time.sleep(1.2)
+    if row is None:
+        print(f"[witp-cmd] ❌ 在 {'N 舰载' if is_naval else 'A 陆基'} 列表里找不到「{ag}」；中止。")
+        _vk("escape"); time.sleep(1.0)
+        return
+    _vc(192, int(row), "click")        # 单击行 → 开详情屏
+    time.sleep(3.0)
+    print(f"[witp-cmd] 找到 {ag} 行 y≈{row:.0f}，已开详情屏")
+
+    final = None
+    for attempt in range(4):
+        y = _locate_panel_row(label)
+        if y is None:
+            print(f"[witp-cmd] ⚠️ 第 {attempt+1} 次：未能在面板中定位 {label} 行")
+            break
+        btns = _row_button_xs(y)
+        if not btns:
+            print(f"[witp-cmd] ⚠️ 第 {attempt+1} 次：未能定位 {label} 行(y={y})按钮")
+            break
+        cur = _read_row_pct(y, btns)
+        print(f"  · 第 {attempt+1} 次：行 y={y}，按钮 x=({btns['zero']}/{btns['minus']}/"
+              f"{btns['plus']}/{btns['full']})，当前读数 = {cur}")
+
+        if cur == pct:
+            final = cur
+            break
+        if cur is None:                                   # 读不出 → 归零后按 +10 计数
+            vnc_click(btns["zero"], y, "click"); time.sleep(0.8)
+            for _ in range(pct // 10):
+                vnc_click(btns["plus"], y, "click"); time.sleep(0.3)
+        elif pct <= 0:
+            vnc_click(btns["zero"], y, "click"); time.sleep(0.8)
+        elif pct >= 100:
+            vnc_click(btns["full"], y, "click"); time.sleep(0.8)
+        elif cur > pct:
+            for _ in range((cur - pct) // 10):
+                vnc_click(btns["minus"], y, "click"); time.sleep(0.3)
+        else:
+            for _ in range((pct - cur) // 10):
+                vnc_click(btns["plus"], y, "click"); time.sleep(0.3)
+        time.sleep(1.0)
+
+    y = _locate_panel_row(label)
+    if y is not None:
+        btns = _row_button_xs(y)
+        final = _read_row_pct(y, btns) if btns else None
+    vnc_key("escape")
+    time.sleep(1.5)
+
+    # ★2026-10-04 修：面板内 OCR 读数不可靠，改用 A/N 列表的权威读数核验★
+    #   实测：详情面板里 Search 行右侧的数字 OCR 长期读不出（None），
+    #   原因未知且不稳定；但**列表行内**的 Search 数值 OCR 稳定可读
+    #   （实测一次读全 8 行：VP11=100 / VP33=50 / No11SqdRAAF=50 …）。
+    #   因此最终判据改为「关掉面板后回列表读该中队 Search 值」。
+    #   注意：舰载中队（VS-/VCS-）在 N 列表，陆基在 A 列表，需分别开对应列表读。
+    verified = _verify_search_via_list(ag, list_key, label, pct)
+    _lname = "N 列表(舰载)" if list_key == "n" else "A 列表(陆基)"
+    if verified is True:
+        print(f"[witp-cmd] ✓ {ag} {label} = {pct}%——经{_lname}权威读数确认生效。")
+        return
+    if verified is False:
+        print(f"[witp-cmd] ⚠️ {ag} {label} 列表读数 ≠ {pct}%，设置未生效。")
+        return
+
+    # ★2026-10-10 修（回读通道错位的真因）★
+    #   实测：**详情屏**里的 Search 数值 OCR 读不出（tokens 里明明是 `Search100`
+    #   却取不到数字），但**列表屏**该列的数值 OCR 稳定。
+    #   ⇒ 最终判据顺序：① 列表屏核验（首选，见 _verify_search_via_list）；
+    #     ② 详情屏回读（兜底）；③ 都失败时**明确提示以读层为准**。
+    if verified is True:
+        return
+    if final is not None and abs(final - pct) <= 10:
+        print(f"[witp-cmd] ✓ {ag} {label} = {final}%（目标 {pct}%）——经详情屏回读确认生效。")
+    else:
+        print(f"[witp-cmd] ⚠️ {ag} {label}：面板回读不可用（详情屏 OCR 读不出数值）。"
+              f"**该指令实际已下发**；权威核验须『存档 → staff --save <档> → 读 "
+              f"airgroups.json 的 percent_{'asw' if getattr(args,'asw',False) else 'search'}』。")
+
+
+def _verify_search_via_list(ag, list_key, label, pct, tries=3):
+    """
+    关掉面板 → 开 A/N 列表 → 定位 ag 所在行 → 读 label 列数值。
+    返回 True（等于目标）/ False（不等于）/ None（该列表读不到，无法判定）。
+    队列名 OCR 会有形近误识，故按「去噪后前缀/子串」匹配，并逐行打印供留痕。
+    """
+    try:
+        from lib.airlist import list_pct
+    except Exception:
+        return None
+
+    key = ag.upper().replace("-", "").replace(" ", "")
+    for _ in range(tries):
+        focus_map()
+        vnc_key(list_key)
+        time.sleep(3.0)
+        data = list_pct()
+        vnc_key("escape")
+        time.sleep(1.0)
+        if not data:
+            continue
+        for name, val in data.items():
+            nk = "".join(ch for ch in name.upper() if ch.isalnum())
+            if nk == key or key.endswith(nk) or nk.endswith(key):
+                print(f"  · 列表核验：{name} 的 {label} = {val}%（目标 {pct}%）")
+                return val == pct
+    return None
+
+
+def cmd_save_game(args):
+    """存档到指定槽位。
+
+    ★指挥官教的方法（2026-09-25，此前我点错目标）★
+      存档对话框里**必须点「小箭头」**，不是行文字/按钮文字：
+        ① 先点**存档栏位旁的小箭头**（x=65，行 y = 123 + 16×槽位号）→ 该栏位**变绿**（选中）；
+        ② 再点**下方 SAVE 旁的小箭头**（62,546）→ 保存成功。
+      此前点 x=250（行文字）→ 栏位从未被选中 → SAVE 无效。实测该对话框对
+      VNC/XTEST/键盘/合成事件均无响应**只针对非箭头目标**；箭头本身是可点的。
+    """
+    slot = max(0, int(args.slot))
+    row_y = 127 + 16 * slot          # ★实测真值（2026-10-14：000=y127，行距16）
+    ARROW_X, SAVE_ARROW = 65, (62, 546)
+    from lib.executor import GAME_SAVE_DIR
+
+    # ★2026-10-10 根治槽位映射 bug★
+    #   实测 --slot 3 会写到 wpae087.pws：row_y=123+16*slot 的箭头点击会命中
+    #   相邻行/滚动后的行，槽位号与实际文件**不保证对应**。
+    #   ⇒ 不再假定 target，改为「存档前后对 SAVE 目录做 mtime 差分」，
+    #     直接探测**实际被写入的那个 .pws**，并据此给出正确的 staff --save 命令。
+    import glob as _glob
+
+    def _snapshot():
+        d = {}
+        for f in _glob.glob(os.path.join(GAME_SAVE_DIR, "wpae*.pws")):
+            try:
+                d[f] = os.path.getmtime(f)
+            except OSError:
+                pass
+        return d
+
+    snap = _snapshot()
+    focus_map()
+    vnc_key("f")
+    time.sleep(3.0)
+
+    # ★2026-10-14 修（槽位映射 bug 根治）★
+    #   旧实现 row_y = 123 + 16*slot 是**外推公式**，实测 --slot 3 → wpae087.pws、
+    #   --slot 5 → wpae134.pws —— 公式与真实对话框行位置**根本不吻合**
+    #   （对话框槽位号并非从 y=123 起每 16px 一行；且列表可能分栏/滚动）。
+    #   ⇒ 改为**从当前对话框截图上 OCR 扫描出「槽位号 → 行 y」的真实映射**，
+    #     直接点该槽位号所在行。扫不到才退回公式（并明确告警）。
+    scanned = _scan_slot_rows()
+    if scanned and slot in scanned:
+        row_y = scanned[slot]
+        src = f"OCR 扫描命中槽位 {slot:03d}"
+    else:
+        src = f"公式外推（OCR 未扫到槽位 {slot:03d}，已扫到 {sorted(scanned)[:12]}）"
+    print(f"[witp-cmd] 存档到槽位 {slot:03d}（{src}；栏位行 y={row_y}，箭头 x={ARROW_X}）...")
+
+    # ① 点栏位旁小箭头 → 变绿选中
+    vnc_click(ARROW_X, row_y, "click")
+    time.sleep(1.2)
+    green = _row_is_green(row_y)
+    print(f"[witp-cmd] ① 已点栏位箭头 (x={ARROW_X}, y={row_y})；该行是否变绿 = {green}")
+
+    # ★★2026-10-15 修（防"点到别的槽位 → 覆写他人存档"）★★
+    #   槽位列表会**滚动**：`y0 + 16×slot` 只在列表停在顶部时成立。
+    #   若 OCR 扫描失败而退回公式外推，点击可能落在**另一个槽位**上，
+    #   随后点 SAVE 就把它**不可逆覆写**（对话框确认即落盘）。
+    #   ⇒ 点 SAVE 之前，必须先把该行的 3 位槽位号 OCR 回来核对；
+    #     对不上就**中止**，绝不冒险写盘。
+    sel = _read_slot_at_row(row_y)
+    ok_sel = (sel == slot)
+    print(f"[witp-cmd] ② 选中行槽位号回读 = {sel}（期望 {slot:03d}）"
+          f" → {'✓ 一致' if ok_sel else '✗ 不一致'}")
+    if not ok_sel:
+        allow = getattr(args, "allow_guess", False)
+        if not allow:
+            vnc_key("escape")
+            time.sleep(1.0)
+            print(f"[witp-cmd] ❌ 中止存档：选中行槽位号 {sel} ≠ 请求 {slot:03d}。"
+                  f"（列表可能已滚动；请先 --list-slots 核对，"
+                  f"确认无误可加 --allow-guess 强制）")
+            return
+        print(f"[witp-cmd] ⚠ --allow-guess：明知槽位号不符仍继续（可能覆写 {sel}）")
+
+    # ③ 点 SAVE 旁小箭头
+    vnc_click(SAVE_ARROW[0], SAVE_ARROW[1], "click")
+    time.sleep(4.0)
+
+    # ③ 差分：找 mtime 变化（或新出现）的 .pws
+    after = _snapshot()
+    changed = [f for f, t in after.items() if snap.get(f) != t]
+    changed.sort(key=lambda f: after[f], reverse=True)
+    if changed:
+        real = changed[0]
+        rslot = os.path.basename(real).replace("wpae", "").replace(".pws", "")
+        tstr = time.strftime("%H:%M:%S", time.localtime(after[real]))
+        print(f"[witp-cmd] ✓ 存档成功：{os.path.basename(real)}（{tstr}）")
+        if rslot != f"{slot:03d}":
+            print(f"[witp-cmd] ⚠ 槽位映射不符：请求 {slot:03d}，实际写入 {rslot}"
+                  f"（row_y={row_y} 命中相邻行）—— 按实际文件为准。")
+        print(f"[witp-cmd]   参谋部可读：witp-cmd staff --save {real}")
+    else:
+        print(f"[witp-cmd] ⚠️ 未检测到任何 .pws 更新（选中状态={green}）—— 请人工核验。")
+
+
+def _scan_slot_rows(box=(60, 100, 240, 720)):
+    """OCR 扫描存档对话框左列，返回 {槽位号(int): 行中心 y}。
+
+    ★2026-10-14 新增（根治槽位映射 bug）★
+      旧实现 `row_y = 123 + 16*slot` 是外推公式，实测偏 4px 且槽位号与文件**不保证对应**
+      （--slot 3 → wpae087、--slot 5 → wpae134）。
+      ★实测真实布局（2026-10-14，tesseract tsv 逐词框）★：
+        栏位号在 x≈81，000=y127, 001=y143, 002=y159, 003=y175, 004=y191, 005=y207 …
+        ⇒ **基准 y0=127、行距 16px**（旧公式 123 是错的）。
+      本函数：OCR 扫出可辨认的槽位号 → 用「基准+行距」最小二乘拟合 →
+      对 OCR 漏读的槽位**外推补齐**（OCR 逐帧波动，单行漏读很常见，不能因漏读就退回旧公式）。
+      拟合残差过大（>6px）时才认为布局变了，退回纯外推。
+    """
+    from PIL import Image, ImageOps
+    import csv as _csv
+    _shot_to("/tmp/_sv_dlg.png")
+    try:
+        im = Image.open("/tmp/_sv_dlg.png").convert("RGB")
+    except Exception:
+        return {}
+    c = ImageOps.autocontrast(ImageOps.grayscale(im.crop(box)))
+    c = c.resize((c.width * 4, c.height * 4), Image.LANCZOS)
+    c.save("/tmp/_sv_dlg_t.png")
+    subprocess.run("tesseract /tmp/_sv_dlg_t.png /tmp/_sv_dlg --psm 6 tsv 2>/dev/null",
+                   shell=True)
+    raw = {}
+    try:
+        with open("/tmp/_sv_dlg.tsv") as f:
+            for r in _csv.DictReader(f, delimiter="\t", quoting=_csv.QUOTE_NONE):
+                t = (r.get("text") or "").strip()
+                dg = re.sub(r"\D", "", t)
+                if len(dg) != 3 or not re.fullmatch(r"\d{3}", t.replace(" ", "")):
+                    continue
+                n = int(dg)
+                if not (0 <= n <= 999):
+                    continue
+                yc = int(r["top"]) / 4.0 + int(r["height"]) / 8.0 + box[1]
+                raw.setdefault(n, int(round(yc)))
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    # 用「基准 y0 + 16×n」拟合；取与众数偏差最小的组合
+    from collections import Counter
+    bases = Counter(int(round(y - 16 * n)) for n, y in raw.items())
+    y0, _cnt = bases.most_common(1)[0]
+    # 残差核验：拟合基准下，已读到的行是否都在 ±6px 内
+    good = {n: y for n, y in raw.items() if abs((y0 + 16 * n) - y) <= 6}
+    if len(good) < max(2, len(raw) // 2):
+        # 布局异常 → 不猜，交调用方告警
+        return raw
+    return {n: y0 + 16 * n for n in range(0, 1000) if y0 + 16 * n <= box[3]}
+
+
+def _read_slot_at_row(row_y, box_x=(60, 130)):
+    """★2026-10-15 新增★ OCR 回读某一行上的 3 位槽位号（用于存档前核对）。
+
+    返回 int 或 None。失败返回 None（调用方须按"未确认"处理，不得当作一致）。
+    """
+    from PIL import Image, ImageOps
+    import csv as _csv
+    _shot_to("/tmp/_svrownum.png")
+    try:
+        im = Image.open("/tmp/_svrownum.png").convert("RGB")
+    except Exception:
+        return None
+    y0 = max(0, int(row_y) - 9)
+    y1 = min(im.height, int(row_y) + 9)
+    c = im.crop((box_x[0], y0, box_x[1], y1))
+    c = ImageOps.autocontrast(ImageOps.grayscale(c))
+    c = c.resize((c.width * 8, c.height * 8), Image.LANCZOS)
+    c.save("/tmp/_svrownum_t.png")
+    r = subprocess.run(["tesseract", "/tmp/_svrownum_t.png", "stdout", "--psm", "7",
+                        "-c", "tessedit_char_whitelist=0123456789"],
+                       capture_output=True, text=True)
+    m = re.search(r"\d{3}", r.stdout)
+    return int(m.group(0)) if m else None
+
+
+def _row_is_green(row_y, x0=80, x1=300):
+    """判定存档对话框某行是否已变为绿色（选中态）。"""
+    from PIL import Image
+    _shot_to("/tmp/_svrow.png")
+    try:
+        im = Image.open("/tmp/_svrow.png").convert("RGB")
+    except Exception:
+        return None
+    px = im.load()
+    g = 0
+    n = 0
+    for y in range(max(0, row_y - 6), min(im.height, row_y + 7)):
+        for x in range(x0, x1, 2):
+            r, gg, b = px[x, y]
+            n += 1
+            if gg > 80 and r < 110 and b < 110:
+                g += 1
+    return (g / n > 0.15) if n else None
+
+
+def cmd_calibrate_map(args):
+    """实测地图几何（像素↔格），全剧本通用。
+
+    做法：在地图上点若干**散布的像素点**，每次读顶栏「Hex:」得到该像素对应的格，
+    再拟合 W/H/原点。解决「比例写死 42.86/37.5 → 系统性偏 1 格」的根因。
+    """
+    import sys as _s
+    _s.path.insert(0, "/root/.hermes/profiles/witp/witp-agent")
+    from lib import mapgeom
+    # ★宽基线采样（2026-09-25 实测得出）★
+    #   原来 9 个点挤在屏幕中部（仅跨 5~6 格），单点 ±1 误读就能撬动斜率
+    #   （跨 20 格累计偏 94~105px）。改为横跨整个视野（≈20 格）+ 纵列取样：
+    #   同样 3~5 处误读下，跨 20 格累计误差降到 22~48px（仍在 1 格内），
+    #   剩余的格级精确度由 set-dest 的闭环纠偏兜底。
+    pts = [(70, 384), (300, 384), (550, 384), (800, 384), (960, 384),
+           (512, 70), (512, 250), (512, 500), (512, 720),
+           (200, 120), (880, 640), (400, 60)]
+    print("[witp-cmd] 开始地图几何标定（点击散点 → 读顶栏 Hex）…")
+    focus_map()
+    samples = []
+    for px, py in pts:
+        vnc_click(px, py, "click")
+        time.sleep(1.2)
+        h = _current_cursor_hex()
+        if h:
+            samples.append((px, py, int(h[0]), int(h[1])))
+            print(f"  ({px},{py}) → Hex({h[0]},{h[1]})")
+        else:
+            print(f"  ({px},{py}) → 读数失败（跳过）")
+    g = mapgeom.fit(samples)
+    if not g:
+        print("[witp-cmd] ❌ 有效样本不足或比例不合理 → 标定失败（将继续使用旧常量）")
+        return
+    print(f"[witp-cmd] ✓ 拟合结果：W={g['W']:.3f} px/格  H={g['H']:.3f} px/格  "
+          f"原点=({g['ox']:.1f},{g['oy']:.1f})  半格偏移={g['shift']:.1f}  "
+          f"RMSE={g['rmse']:.2f}px  样本={g['n']}")
+    print(f"[witp-cmd]   与旧写死值对比：W 42.86 / H 37.5（差 {abs(g['W']-42.86):.3f} / "
+          f"{abs(g['H']-37.5):.3f} px）")
+    mapgeom.save_geom(g)
+    print(f"[witp-cmd]   已缓存 → {mapgeom.CACHE}（set-dest 会自动使用）")
+
+
+def cmd_end_turn(args):
+    """推进过回合 (E 键 + 确认 YES + 等待结算)"""
+    timeout = args.timeout
+    print(f"[witp-cmd] 执行指令：确认下达过回合指令 (E + YES 确认，等待结算)...")
+    # ★2026-10-15：end_turn 返回 False 有**三种**互不相同的含义，
+    #   旧代码一概说成"结算超时"，误导上层（实测回归局把"本局已结束"
+    #   报成 3 次"超时"）。这里显式区分：
+    #     ① 本局已结束（终局屏已被处理，game_ended.json 在）→ 不是错误
+    #     ② 硬闸拦截（ui_state != map）→ 需要清场后重试
+    #     ③ 真·结算超时 → autosave 未更新
+    try:
+        from lib.executor import game_has_ended as _ghe
+    except Exception:
+        _ghe = None
+    ended = _ghe() if _ghe else None
+    if ended:
+        js = ended.get("JAPANESE"); al = ended.get("ALLIED")
+        print(f"[witp-cmd] ⛔ 本局已结束（{ended.get('keyword')}"
+              f"{f'，日 {js} : 盟 {al}' if js is not None else ''}）"
+              f"—— 未发送 E；这不是错误。请开新局或载入其它存档。")
+        return
+    success = end_turn(wait_for_save=True, timeout_sec=timeout)
+    if success:
+        print("[witp-cmd] ✓ 回合结算完成！新存档已写入，战报已生成。")
+    else:
+        print("[witp-cmd] ⚠️ 结算未确认。三种可能：①本局已结束；"
+              "②硬闸拦截（ui_state≠map，需 Escape 清场重试）；③真·结算超时"
+              "（autosave 未更新）。请查上方 [executor] 行确认具体原因。")
+
+def _menu_detect():
+    """检测游戏当前是否停在主菜单（OCR）。
+
+    ★2026-10-17 修复★ 原判据 `SCENARIOSELECTION / GAMESTYLE / REALISMOPTIONS` 在
+      1108r9 英文版上**恒为假**：这三个词是艺术字体，psm 11 读不出来（实测同一帧只
+      读出 JAPANESE COMPUTER / ALLIED COMPUTER / PLAY BY EMAIL / BOTH COMPUTER）。
+      症状：主菜单明明在前台，`set-gamestyle` 却报「当前不在主菜单」而直接 return
+      （2026-10-17 实测踩坑）。⇒ 改用**实际可读到的 GAMESTYLE 选项文字**作判据。
+    """
+    try:
+        _shot_to("/tmp/_gs_menu.png")
+        t = subprocess.run(["tesseract", "/tmp/_gs_menu.png", "-", "--psm", "11"],
+                           capture_output=True, text=True).stdout.upper().replace(" ", "").replace("\n", "")
+        # 主菜单独有的组合（至少两项同时出现才算，避免误判游戏内画面）
+        hits = sum(1 for k in ("JAPANESECOMPUTER", "ALLIEDCOMPUTER", "PLAYBYEMAIL",
+                               "BOTHCOMPUTER", "HEADTOHEAD",
+                               "SCENARIOSELECTION", "GAMESTYLE", "REALISMOPTIONS")
+                   if k in t)
+        return hits >= 2
+    except Exception:
+        return False
+
+
+# ★GAMESTYLE 五个选项的标签中心（2026-10-12 用 tesseract tsv 实测词框计算）★
+#   JAPANESE COMPUTER 标签 left=445 top=110 w~242 → 中心 (566,120)
+#   ALLIED   COMPUTER 标签 left=566 top=168 w~204 → 中心 (660,178)
+#
+# ★2026-10-17 补全为五种（手册 §2.3.1 全部五种 GAMESTYLE）★
+#   同一张主菜单截图（/tmp/menu_now.png）用「亮像素行投影 + 列投影 + 逐段裁切 OCR 复核」
+#   重新标定，五段文字的实测外接框如下（x0-x1 @ y0-y1，取自 1024x768 全屏）：
+#     JAPANESE COMPUTER  x 446-686 @ y 110-129  → 中心 (566,120)
+#     ALLIED   COMPUTER  x 547-768 @ y 167-187  → 中心 (657,177)
+#     PLAY BY EMAIL      x 135-349 @ y 266-287  → 中心 (242,277)
+#     BOTH     COMPUTER  x 557-784 @ y 266-287  → 中心 (670,277)
+#     HEAD TO HEAD       x 170-478 @ y 359-392  → 中心 (324,375)
+#   ※ 第2行左侧 x379-519 是旋钮/刻度盘反光，不是文字（OCR 空），不要点。
+#   ※ 第4行右侧 x639-825 是 REALISM OPTIONS 按钮，不是 GAMESTYLE 选项。
+_GAMESTYLE_CLICK = {
+    "japanese":  (566, 120),   # AI 打日军 → 人类执【盟军】
+    "allied":    (657, 177),   # AI 打盟军 → 人类执【日军】
+    "pbem":      (242, 277),   # PLAY BY EMAIL —— 两人邮件对战
+    "both":      (670, 277),   # BOTH COMPUTER —— AI 对 AI（观察模式）
+    "h2h":       (324, 375),   # HEAD TO HEAD —— 两人同机热座
+}
+
+# GAMESTYLE → (语义名, 说明)。用于日志与运行后判据。
+_GAMESTYLE_DESC = {
+    "japanese": ("JAPANESE COMPUTER", "AI 打日军 / 人类执盟军"),
+    "allied":   ("ALLIED COMPUTER",   "AI 打盟军 / 人类执日军"),
+    "pbem":     ("PLAY BY EMAIL",     "PBEM 两人邮件对战（需双方密码）"),
+    "both":     ("BOTH COMPUTER",     "电脑对电脑（AI 双方，观察模式）"),
+    "h2h":      ("HEAD TO HEAD",      "双人热座（同一台机轮流下命令）"),
+}
+
+
+def _read_topbar_side():
+    """读顶栏 PLAYER 字段（游戏内才有）。返回 JAPANESE / ALLIED / UNKNOWN。"""
+    try:
+        _shot_to("/tmp/_gs_bar.png")
+        subprocess.run("DISPLAY=:98 convert /tmp/_gs_bar.png -crop 520x28+360+0 +repage "
+                       "-resize 300% /tmp/_gs_bar2.png", shell=True, capture_output=True)
+        t = subprocess.run(["tesseract", "/tmp/_gs_bar2.png", "-", "--psm", "11"],
+                           capture_output=True, text=True).stdout.upper().replace(" ", "")
+        if "JAPANESE" in t:
+            return "JAPANESE"
+        if "ALLIED" in t:
+            return "ALLIED"
+    except Exception:
+        pass
+    return "UNKNOWN"
+
+
+def cmd_set_gamestyle(args):
+    """设置主菜单 GAMESTYLE —— 决定【人类玩家执哪一方】。
+
+    ★★★2026-10-12 判决性实验确立的机制（推翻此前"存档自带阵营"的误解）★★★
+      人类阵营由**主菜单 GAMESTYLE 旋钮**决定，存档（.pws）本身不保存玩家阵营。
+        JAPANESE COMPUTER（旋钮默认位）= AI 打日军 / 人类执【盟军】
+        ALLIED COMPUTER                = AI 打盟军 / 人类执【日军】
+      同一份 wpae000.pws 的两次受控实验（唯一变量 = GAMESTYLE）：
+        · 默认 JAPANESE COMPUTER → 载入后顶栏 = ALLIED PLAYER
+        · 改点 ALLIED COMPUTER   → 载入后顶栏 = JAPANESE PLAYER
+      实验证据：/tmp/judge.log、/tmp/judge2.log；截图 /tmp/curr_v_tb.png。
+      ⇒ 载入存档前**必须先设 GAMESTYLE**；否则无论载入谁的存档，玩家都会变成盟军。
+      ⇒ witp-launch-en1108.sh 与 cmd_recover 此前都不设 GAMESTYLE，是"总是变成盟军"的真因。
+    """
+    want = (args.side or "japanese").lower()
+    # 向后兼容：旧调用 `set-gamestyle japan` 仍有效
+    if want == "japan":
+        want = "japanese"
+    if want not in _GAMESTYLE_CLICK:
+        print(f"[witp-cmd] 未知模式 {want}（可选 japanese / allied / pbem / both / h2h）")
+        return
+    if not _menu_detect():
+        print("[witp-cmd] ⚠ 当前不在主菜单。请先退到主菜单，或加 --restart 让它自己重启。")
+        if not getattr(args, "restart", False):
+            return
+        print("[witp-cmd] --restart：重启游戏服务...")
+        subprocess.run("systemctl stop witp-game-en", shell=True)
+        time.sleep(10)
+        subprocess.run("systemctl start witp-game-en", shell=True)
+        for i in range(30):
+            time.sleep(5)
+            if _menu_detect():
+                print(f"[witp-cmd] 主菜单就绪（{(i + 1) * 5}s）")
+                break
+        if not _menu_detect():
+            print("[witp-cmd] ✗ 超时仍未到主菜单")
+            return
+    x, y = _GAMESTYLE_CLICK[want]
+    label, desc = _GAMESTYLE_DESC[want]
+    print(f"[witp-cmd] 点 GAMESTYLE = {label} @ ({x},{y})")
+    vnc_click(x, y, "click")
+    time.sleep(2.0)
+    print(f"[witp-cmd] ✓ 已设置：{label} —— {desc}")
+    if want in ("japanese", "allied"):
+        side_word = "日军" if want == "allied" else "盟军"
+        other = "盟军" if want == "allied" else "日军"
+        print(f"[witp-cmd] 此后载入存档：人类执【{side_word}】，AI 打【{other}】。")
+    elif want == "both":
+        print("[witp-cmd] 两边都交给 AI 后，人类不进入命令阶段；回合会自行推进（观察模式）。")
+    elif want == "h2h":
+        print("[witp-cmd] 热座：提交日军命令后需在同一台机切到盟军方下命令。")
+    elif want == "pbem":
+        print("[witp-cmd] PBEM：开局会要求双方各设密码；每回合需把 .wps 存档（及 slot 001 战报）交给对方。")
+    print("[witp-cmd] 注意：主菜单 OCR 读不出旋钮指针，最终以【载入后顶栏 PLAYER】为准。")
+
+
+def cmd_recover(args):
+    """崩溃自愈：结算期 Wine 偶发 page fault 会让游戏退回主菜单（画面全黑/显示 MAIN MENU）。
+
+    ★2026-09-24 新增★ 把「重启 + 经 VNC 通道载入 Autosave」这一手工恢复流程固化。
+    恢复路径（2026-09-24 实测有效）：
+      重启游戏 → 主菜单 LOAD A SAVED GAME (738,644) 双击 → 存档列表 000 行 y=212 单击
+      → SELECT SAVE GAME (337,577) 单击 → 回到命令阶段地图。
+    ★2026-10-12 修复★ 载入前必设 GAMESTYLE（见 cmd_set_gamestyle 的机制说明），
+      否则载入后玩家阵营会变成盟军 —— 这正是此前"autosave 里有盟军局存档"的错觉来源。
+    """
+    from PIL import Image, ImageStat
+    print("[witp-cmd] 崩溃自愈检查...")
+
+    # ★2026-10-04：弃用 pgrep -f / pkill -f。
+    #   之前用 -f 匹配完整命令行，shell 包装进程、timeout、乃至本函数所在的
+    #   witp-cmd 自身命令行里都含同一串文本 → 会匹配到自己并自杀（已实测发生过）。
+    #   改为直接遍历 /proc 读 comm 精确比对可执行文件名。
+    def _game_pids():
+        pids = []
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                with open(f"/proc/{d}/comm", "r") as f:
+                    c = f.read().strip()
+            except OSError:
+                continue
+            # ★Linux 的 /proc/<pid>/comm 硬截断到 15 字符（TASK_COMM_LEN=16 含 NUL），
+            #   所以 "War in the Pacific Admiral Edition.exe" 实际只露出 "War in the Paci"。
+            #   早先按全名比对恒为空 → recover 会误判「进程已死」并去重启。
+            if c == "War in the Paci":
+                pids.append(int(d))
+        return pids
+
+    pids = _game_pids()
+    print(f"[witp-cmd] 游戏进程存活: {bool(pids)}  pids={pids}")
+    alive = bool(pids)
+
+    dark = True
+    try:
+        _shot_to("/tmp/_recover.png")
+        mean = ImageStat.Stat(Image.open("/tmp/_recover.png").convert("RGB")).mean
+        dark = (sum(mean) / 3) < 12
+        print(f"[witp-cmd] 游戏区画面均值: {[round(x, 1) for x in mean]}（黑屏判定阈值 12）")
+    except Exception as e:
+        print(f"[witp-cmd] 画面检测失败: {e}")
+
+    # ★2026-10-10 新增：黑屏窗口恢复（非破坏性，优先于重启游戏）★
+    #   现象：游戏进程存活（alive=True），但截图全黑 / 窗口 Map State 为 IsUnMapped
+    #   或 IsUnviewable。真因是重启/重启 openbox 后游戏窗口失去映射状态。
+    #   ★实测配方★（亮度 0 → 114、Map State IsUnMapped → IsViewable）：
+    #       xdotool windowraise <游戏窗>  +  wmctrl -a <标题片段>
+    #   该配方**不重启游戏、不丢局面**，必须先试；失败才走下面的重启流程。
+    if alive and dark and not args.force:
+        wid = subprocess.run("DISPLAY=:98 xdotool search --name 'War in the Pacific' | head -1",
+                             shell=True, capture_output=True, text=True).stdout.strip()
+        if wid:
+            st = subprocess.run(f"DISPLAY=:98 xwininfo -id {wid} | grep -i 'Map State'",
+                                shell=True, capture_output=True, text=True).stdout.strip()
+            print(f"[witp-cmd] 窗口 {wid}：{st}")
+            print("[witp-cmd] 尝试非破坏性恢复（windowraise + wmctrl -a）...")
+            for act in (f"DISPLAY=:98 xdotool windowraise {wid}",
+                        "DISPLAY=:98 xdotool windowactivate --sync " + wid,
+                        "DISPLAY=:98 wmctrl -a 'Admiral'"):
+                subprocess.run(act, shell=True, capture_output=True)
+                time.sleep(0.8)
+            time.sleep(2.0)
+            try:
+                _shot_to("/tmp/_recover2.png")
+                m2 = ImageStat.Stat(Image.open("/tmp/_recover2.png").convert("RGB")).mean
+                if (sum(m2) / 3) >= 12:
+                    print(f"[witp-cmd] ✓ 非破坏性恢复成功（均值 "
+                          f"{[round(x,1) for x in m2]}）——无需重启游戏。")
+                    return
+                print(f"[witp-cmd] 非破坏性恢复未生效（均值 "
+                      f"{[round(x,1) for x in m2]}）→ 转重启流程。")
+            except Exception as e:
+                print(f"[witp-cmd] 复检失败: {e}")
+
+    print("[witp-cmd] 需要恢复 → 重启游戏...")
+    for pid in _game_pids():                 # 按精确 PID 杀，不做模式匹配
+        try:
+            os.kill(pid, 9)
+            print(f"[witp-cmd]   killed pid={pid}")
+        except OSError as e:
+            print(f"[witp-cmd]   kill {pid} 失败: {e}")
+    time.sleep(3)
+    env = dict(os.environ, DISPLAY=":98", WINEPREFIX="/root/.wine-witp",
+               HOME="/root", LANG="en_US.UTF-8")
+    subprocess.run("pgrep -x openbox >/dev/null || (DISPLAY=:98 openbox >/tmp/openbox.log 2>&1 &)",
+                   shell=True)
+    time.sleep(1)
+    subprocess.Popen(["bash", "/root/.hermes/workspace/witp-launch-en1108.sh"],
+                     stdout=open("/tmp/witp_recover.log", "w"),
+                     stderr=subprocess.STDOUT, env=env,
+                     cwd="/root/.wine-witp/drive_c/1108r9/War in the Pacific Admiral's Edition")
+    for i in range(24):
+        time.sleep(5)
+        if _game_pids():
+            print(f"[witp-cmd] 游戏进程已出现（{(i + 1) * 5}s）")
+            break
+    time.sleep(25)   # 等主菜单绘制完成
+
+    print("[witp-cmd] 经 VNC 通道进入载入存档流程...")
+    # ★2026-10-12 关键修复★ 载入前必须先设 GAMESTYLE = ALLIED COMPUTER（人类执日军）。
+    #   否则按旋钮默认位 JAPANESE COMPUTER 载入，玩家会变成盟军
+    #   —— 这就是此前"autosave 里怎么会有盟军局存档"的错觉来源。
+    #   受控实验见 cmd_set_gamestyle 文档串与 /tmp/judge.log、/tmp/judge2.log。
+    gx, gy = _GAMESTYLE_CLICK["allied"]
+    print(f"[witp-cmd] 先设 GAMESTYLE = ALLIED COMPUTER（人类执日军）@ ({gx},{gy})")
+    vnc_click(gx, gy, "click")
+    time.sleep(2.0)
+    vnc_click(742, 645, "click")             # LOAD A SAVED GAME
+    time.sleep(6)
+    # ★2026-10-13 修（原坐标全错）★ 旧代码点 (738,644)dblclick + (388,slot_row) + (525,727)，
+    #   实测 (388, …) 与 (525,727) 都不在正确控件上 ⇒ 载入从未真正发生。
+    #   已验证可用的序列（2026-10-13 判决性实验，/tmp/jl2.log）：
+    #     点 LOAD A SAVED GAME (742,645) → 选槽位行 (250, 214) → 确认按钮 (336,572)
+    #   判据：操作后 **.pws 无任何写入**（非覆盖）且 **顶栏 = JAPANESE PLAYER**。
+    #   注意：该对话框右上铭牌恒写着 `SAVE MENU`（WitP 的 UI 缺陷），
+    #   但经 `LOAD A SAVED GAME` 按钮进入时，点槽位+按钮的行为是**载入**。
+    vnc_click(250, args.slot_row if args.slot_row != 212 else 214, "click")  # 槽位 000 行
+    time.sleep(1.5)
+    vnc_click(336, 572, "click")             # 底部确认按钮（实测成功点）
+    time.sleep(15)
+    print("[witp-cmd] ✓ 恢复流程已执行 —— 请用 witp-cmd status / 读层核对是否回到命令阶段。")
+    # ★2026-10-15★ 恢复/载入存档 = 重新开始推演，必须清掉上一局的结束标记，
+    #   否则 end-turn 会短路（这是"载入后无法推进回合"的隐藏原因）。
+    try:
+        os.remove("/root/.hermes/workspace/game_ended.json")
+        print("[witp-cmd] 已清除『本局已结束』标记（允许继续推进）。")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[witp-cmd] ⚠ 清除结束标记失败: {e}")
+
+
+def cmd_status(args):
+    """检查当前游戏画面与窗口状态"""
+    ox, oy = get_window_offset()
+    print(f"[witp-cmd] 游戏窗口偏移量: upper-left X={ox}, Y={oy}")
+    shot_path = "/tmp/witp_cmd_status.png"
+    subprocess.run(["import", "-window", "root", "-display", ":98", shot_path], check=False)
+    subprocess.run(["convert", shot_path, "-resize", "150%", "-colorspace", "Gray", "/tmp/_ocr.png"], check=False)
+    ocr_out = subprocess.check_output(["tesseract", "/tmp/_ocr.png", "-", "--psm", "11"], stderr=subprocess.DEVNULL).decode()
+    lines = [l.strip() for l in ocr_out.split("\n") if l.strip()][:15]
+    print("[witp-cmd] 屏幕前 15 行 OCR 内容识别：")
+    for l in lines:
+        print("  |", l)
+
+def cmd_record_turn(args):
+    """回写本回合因果三元组 (S, D, R)"""
+    if not _STAFFOPS:
+        print(f"[witp-cmd] 回写模块加载失败: {_STAFFOPS_ERR}"); return
+    orders = []
+    if args.orders:
+        orders = [o.strip() for o in args.orders.split(";") if o.strip()]
+    record_turn(args.decision, args.result, orders=orders, game_id=args.game, verbose=True)
+
+
+def cmd_set_target(args):
+    """设航空队 Target hex（对地/对机场轰炸的必要条件）。"""
+    try:
+        import sys as _s
+        _s.path.insert(0, "/root/.hermes/workspace")
+        from witp_airtarget import set_airgroup_target
+    except Exception as _e:
+        print(f"[witp-cmd] ✗ 航空队目标模块加载失败: {_e}")
+        return 1
+    hx, hy = [int(v) for v in str(args.hex).replace(" ", "").split(",")[:2]]
+    tpx = None
+    if getattr(args, "px", None):
+        p = str(args.px).replace(" ", "").split(",")
+        tpx = (int(p[0]), int(p[1]))
+    print(f"[witp-cmd] 设 {args.group} 的 Target = ({hx},{hy})"
+          f"{'，点像素 ' + str(tpx) if tpx else '（未给像素：进入选靶态后需定位目标）'}")
+    ok, info = set_airgroup_target(args.group, hx, hy, tpx)
+    if ok is None and isinstance(info, dict) and info.get("need_px"):
+        print(f"[witp-cmd] ⏸ 选靶态已就绪，截图 {info.get('screenshot')}")
+        print(f"[witp-cmd] 需用 vision 定位目标基地图标像素后重跑："
+              f"witp-cmd set-target --group '{args.group}' --hex {args.hex} --px <X,Y>")
+        return 2
+    if ok:
+        print(f"[witp-cmd] ✓ 目标指令已下发：{info}")
+        print(f"[witp-cmd] ⚠ 权威核验：save-game → witp_read.sh <档> → "
+              f"airgroups.json 的 target_x/target_y 是否 = ({hx},{hy})")
+    else:
+        print(f"[witp-cmd] ✗ 失败：{info}")
+        return 1
+    return 0
+
+
+def cmd_close_game(args):
+    """归档对局战果并追加台账"""
+    if not _STAFFOPS:
+        print(f"[witp-cmd] 回写模块加载失败: {_STAFFOPS_ERR}"); return
+    close_game(args.outcome, enemy_score=args.enemy_score, own_score=args.own_score,
+               notes=args.notes or "", game_id=args.game, verbose=True)
+
+
+def _set_current_game(game_id):
+    """锁定当前对局编号（写 games/_current_game 锚点）。"""
+    if not _STAFFOPS:
+        print(f"[witp-cmd] 回写模块加载失败: {_STAFFOPS_ERR}"); return
+    r = set_current_game(game_id, verbose=True)
+    if not r.get("ok"):
+        print(f"[witp-cmd] ✗ {r.get('error')}")
+
+
+def _new_game(args):
+    """新建一局并锁定为当前对局。"""
+    if not _STAFFOPS:
+        print(f"[witp-cmd] 回写模块加载失败: {_STAFFOPS_ERR}"); return
+    new_game(verbose=True)
+    # ★2026-10-15★ 新局必须清掉上一局的「已结束」标记，
+    #   否则 end-turn 会短路拒绝推进（实测标记会跨局残留）。
+    try:
+        os.remove("/root/.hermes/workspace/game_ended.json")
+        print("[witp-cmd] 已清除上一局的『本局已结束』标记。")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[witp-cmd] ⚠ 清除结束标记失败: {e}")
+    print("[witp-cmd] 提示：游戏内还需新开局（SCENARIO SELECTION → 003 → SELECT SCENARIO → START GAME）")
+
+
+def cmd_skb(args):
+    """知识库：默认看状态；--add 追加教条并提交"""
+    if not _STAFFOPS:
+        print(f"[witp-cmd] 知识库模块加载失败: {_STAFFOPS_ERR}"); return
+    if args.add:
+        skb_add_doctrine(args.add, confidence=args.confidence, evidence=args.evidence,
+                         verbose=True, scope=getattr(args, "scope", "strategy"))
+    else:
+        skb_status(verbose=True)
+
+
+def cmd_strike_audit(args):
+    """舰载机出击能力审计（对照手册第07章出击成立条件逐条核）。"""
+    state = args.state or "/root/.hermes/workspace/witp-reader/state"
+    ships_p = os.path.join(state, "ships.json")
+    ags_p = os.path.join(state, "airgroups.json")
+    if not (os.path.exists(ships_p) and os.path.exists(ags_p)):
+        print(f"[witp-cmd] ✗ 读层数据缺失：{ships_p} / {ags_p}")
+        return 1
+    ships = json.load(open(ships_p, encoding="utf-8"))
+    ships = ships if isinstance(ships, list) else ships.get("ships", [])
+    ags = json.load(open(ags_p, encoding="utf-8"))
+    ags = ags if isinstance(ags, list) else ags.get("airgroups", ags.get("groups", []))
+
+    MISSION = {0: "未设", 1: "对机场", 2: "对港口", 3: "对海攻击", 4: "对地",
+               5: "侦察", 6: "护航/CAP", 7: "对海搜索", 8: "反潜", 9: "对城市"}
+    PCT_KEYS = ("percent_cap", "percent_lrcap", "percent_asw",
+                "percent_search", "percent_train", "percent_rest")
+
+    # ★2026-09-29 修复（换阵营暴露）★ 原判据写死 `nation == "USNAVY"`，
+    #   日军侧（IJNAVY）永远匹配不到 → 审计直接报"没有我方航母"。
+    #   改为**按舰种枚举我方航母**，不绑国籍；若读层混入敌舰，
+    #   用「与已知我方国籍集合一致」兜底过滤。
+    cvs_all = [s for s in ships
+               if str(s.get("ship_class_type_name")) in ("CV", "CVL", "CVE")]
+    # 取读层里出现次数最多的国籍作为「我方」（读层只导出玩家一侧的编队明细，
+    #  但 ships.json 有时含少量敌舰）——不写死任何阵营字面量。
+    _nat = {}
+    for _s in ships:
+        _n = str(_s.get("nation") or "")
+        if _n:
+            _nat[_n] = _nat.get(_n, 0) + 1
+    own_nat = {max(_nat, key=_nat.get)} if _nat else set()
+    cvs = [s for s in cvs_all if not own_nat or str(s.get("nation")) in own_nat]
+    if not cvs:
+        print(f"[witp-cmd] 读层里没有我方航母（舰种 CV/CVL/CVE 计数 {len(cvs_all)}，"
+              f"国籍分布 {_nat}）")
+        return 1
+
+
+    print("=" * 78)
+    print("  舰载机出击能力审计（对照手册 7.2.1.10.1 / 7.2.1.12 / 7.2.1.7.1）")
+    print("=" * 78)
+    total_strike = 0
+    problems = []
+    for cv in cvs:
+        name = cv.get("name")
+        print(f"\n  【{name}】({cv.get('x')},{cv.get('y')})  TF{cv.get('task_force_id')}  "
+              f"载机量{cv.get('aircraft_capacity')}  系统损伤{cv.get('system_damage')}")
+        groups = [g for g in ags if g.get("stationed_on_ship_name") == name]
+        if not groups:
+            print("    （读层里找不到该舰的航空队）")
+            continue
+        strike_ready = 0
+        for g in groups:
+            mc = g.get("primary_mission_code")
+            used = sum(int(g.get(k) or 0) for k in PCT_KEYS)
+            free = max(0, 100 - used)
+            ready = int(g.get("aircraft_active") or 0)
+            mx = int(g.get("aircraft_max") or 0)
+            atype = str(g.get("aircraft_type_name") or "")
+            is_strike = atype in ("DB", "TBF", "TB", "FB")
+            contrib = round(ready * free / 100.0) if is_strike else 0
+            strike_ready += contrib
+            flag = ""
+            if ready == 0:
+                flag = "  ⚠ 无可用机"
+                problems.append(f"{name}/{g.get('name')}：可用机 0")
+            elif is_strike and free == 0:
+                flag = "  ⚠ 搜索占满，对海攻击余量 0"
+                problems.append(f"{name}/{g.get('name')}：搜索占比占满，无对海攻击余量")
+            elif is_strike and mc != 3:
+                flag = "  ⚠ 任务不是对海攻击"
+                problems.append(f"{name}/{g.get('name')}：任务码 {mc} 不是对海攻击")
+            print(f"    {str(g.get('name')):<8}{str(g.get('aircraft_name')):<18}"
+                  f"任务={str(MISSION.get(mc, mc)):<9}搜索={str(g.get('percent_search')):>4}% "
+                  f"CAP={str(g.get('percent_cap')):>4}%  可用={ready:>3}/{mx:<3}"
+                  f"可出击≈{contrib:<4}{flag}")
+        total_strike += strike_ready
+        print(f"    → 该舰当回合可投入对海攻击的飞机 ≈ {strike_ready} 架")
+
+    print("\n" + "-" * 78)
+    print(f"  合计可投入对海攻击 ≈ {total_strike} 架")
+    print("  读层无法核验、必须进游戏看的硬阻断项：")
+    print("    ① 出击架次 Max Sorties —— 归零则该舰完全不能执行进攻任务（手册 7.2.1.10.1）")
+    print("    ② 航母所在格 / 目标格天气 —— 恶劣天气在起飞前中止进攻任务（手册 7.2.1.12）")
+    if problems:
+        print("\n  ⚠ 发现的问题：")
+        for p in problems:
+            print(f"    - {p}")
+    else:
+        print("\n  ✓ 读层可见项均正常（任务=对海攻击、有可用机、搜索未占满）")
+    return 0
+
+
+def cmd_set_tf_mission(args):
+    """改 TF 任务（Mission）—— 补齐命令面核心缺口（社区配方必需）。
+
+    ★2026-10-13 实机标定并接入★ 通道与判据详见 `witp_tf_mission.py` 模块文档串。
+    要点：
+      · Mission 行左侧**圆底箭头图标** @(704,198) → 弹 `Set TF Information` 对话框；
+      · 左列任务行中心 y = 252(Surface) / 270(Bombardment) / 287(Fast Transport) /
+        306(Transport) / 324(Cargo)；可靠点击 x=200；选中态 = 该行变**绿色高亮**；
+      · Done @(256,519)；
+      · ★UI 回读只作过程证据，最终必须走「存档 → 读层 taskforces.json 的 mission」核验★。
+    动机：游戏会把水面编队的 BOMBARDMENT **自动改回 SURFACE**，
+    而社区陆战教条（SKB #88）要求用**舰炮击压制守军**才可能攻占莫港 ——
+    此前工具没有改 TF 任务的命令，导致该配方无法执行。
+    """
+    sys.path.insert(0, "/root/.hermes/workspace")
+    try:
+        from witp_tf_mission import set_tf_mission, TF_LIST_ROW
+    except Exception as e:
+        print(f"[witp-cmd] 模块加载失败: {e}")
+        return 1
+    row = args.row if args.row is not None else TF_LIST_ROW.get(args.tf, 317)
+    # ★2026-10-15★ 传 TF 编号给底层：它会 OCR 按编号定位真实行 y
+    #   （行位在同局内会漂移；写死行号曾点到 TF7 而非 TF6）。
+    import re as _re
+    _m = _re.search(r"(\d+)", str(args.tf))
+    tf_num = int(_m.group(1)) if _m else None
+    print(f"[witp-cmd] 改 {args.tf} 任务 → {args.mission}（回退行 y={row}）")
+    ok = set_tf_mission(row, args.mission, tf_num=tf_num)
+    print("[witp-cmd] ⚠ 权威核验：save-game → witp-reader/witp_read.sh <档> → taskforces.json 的 mission")
+    return 0 if ok else 1
+
+
+def cmd_set_mission(args):
+    """设置航空队任务（任务可自由指派，不必跟中队名走）。
+
+    界面路径：按 N 开舰载航空队列表 → 点该中队行开详情屏 → 点任务列表左侧箭头。
+    任务箭头坐标（实测）：x=653，y 按任务：
+      Airfield Attack 144 / Port Attack 155 / Naval Attack 167 / Ground Attack 179 /
+      Recon 191 / Naval Search 203 / ASW Patrol 215 / Supply Transport 226 /
+      City Attack 239 / Training 251 / Stand Down 263
+    （任务文本行 y = 箭头 y + 5，实测首行 148、行距 12px，与上表一致）
+    """
+    MISSION_Y = {
+        "airfield": 144, "airfield attack": 144,
+        "port": 155, "port attack": 155,
+        "naval attack": 167, "naval": 167,
+        "ground": 179, "ground attack": 179,
+        "recon": 191,
+        "naval search": 203, "search": 203,
+        "asw": 215, "asw patrol": 215,
+        "supply": 226, "supply transport": 226,
+        "city": 239, "city attack": 239,
+        "training": 251,
+        "rest": 263, "stand down": 263,
+    }
+    key = args.mission.strip().lower()
+    y = MISSION_Y.get(key)
+    if y is None:
+        print(f"[witp-cmd] ✗ 未知任务「{args.mission}」；可用：{' / '.join(sorted(set(MISSION_Y)))}")
+        return 1
+
+    from lib.executor import vnc_key, vnc_click
+    # ★2026-10-01 修（换阵营暴露的「写死单侧」缺陷）★
+    #   原实现**无条件按 N 开舰载航空队列表** —— 但日军/盟军都有大量**陆基**中队
+    #   （如日军 `Genzan Ku K-1` 在拉包尔），它们只在 A 列表里 ⇒ 永远找不到。
+    #   改为**读层权威判据**：凡出现在我方航母 airgroups 名单里的即舰载（N），否则陆基（A）。
+    #   与阵营命名无关，零硬编码。
+    try:
+        from witp_ground_orders import _is_carrier_group as _icg  # noqa
+        _naval = bool(_icg(args.group))
+    except Exception:
+        _naval = any(k in str(args.group).upper() for k in ("VF-", "VB-", "VS-", "VT-", "VCS-"))
+    _key = "n" if _naval else "a"
+    print(f"[witp-cmd] 设置 {args.group} 任务 = {args.mission}"
+          f"（{'舰载 N' if _naval else '陆基 A'} 列表，箭头 x=653,y={y}）")
+    vnc_click(300, 500, "click")
+    time.sleep(0.5)
+    vnc_key(_key)                     # 打开对应航空队列表
+    time.sleep(3)
+
+    # ★2026-10-01 修（换阵营暴露的「逐词精确比对」缺陷）★
+    #   原实现把 TSV 每个**单词**与队名整串比对（且 x 过滤 150..260）。
+    #   但 OCR 会把 `Genzan Ku K-1` 拆成 `Genzan`/`Ku`/`K-41` 三个词，
+    #   任何一个都不等于整串 ⇒ 永远匹配不上（陆基中队因此全设不上任务）。
+    #   改用已验证的 `_find_airgroup_row`：按 y 归并成行、整行归一后再匹配，
+    #   并带字形混淆归一（V/Y、I/L、O/0、S/5、B/8）与唯一性要求。
+    # ★2026-10-13 新增 --row★ 绕过 OCR 定位，直指列表行中心 y。
+    #   动机：日军队名 OCR 极难辨认（`Genzan Ku K-2` → `genzankukk2g3m2nel`），
+    #   当同一基地有两支同名中队时整行归一仍可能匹配失败 ⇒ 提供人工/脚本直指行号的后门。
+    if getattr(args, "row", None):
+        row_y = float(args.row)
+        print(f"[witp-cmd] 使用 --row 指定行 y={row_y:.0f}（绕过 OCR 定位）")
+    else:
+        row_y = _find_airgroup_row(args.group, _key)
+    if row_y is None:
+        print(f"[witp-cmd] ✗ 在航空队列表里找不到「{args.group}」"
+              f"（可加 --row <y> 直指行号）")
+        return 1
+    print(f"[witp-cmd] 找到 {args.group} 行 y≈{row_y:.0f}，点开详情屏")
+    vnc_click(192, int(row_y), "click")
+    time.sleep(3)
+
+    vnc_click(653, y, "click")         # 点任务箭头
+    time.sleep(2)
+
+    if not args.no_verify:
+        _shot_to("/tmp/_sm_after.png")
+        try:
+            import subprocess as _sp
+            _sp.run("convert /tmp/_sm_after.png -resize 200% -colorspace Gray -normalize /tmp/_sm_g2.png",
+                    shell=True, capture_output=True)
+            tsv = _sp.run("tesseract /tmp/_sm_g2.png - --psm 11 tsv", shell=True,
+                          capture_output=True, text=True).stdout
+            hits = []
+            for line in tsv.splitlines()[1:]:
+                p = line.split("\t")
+                if len(p) < 12:
+                    continue
+                t = p[11].strip()
+                if len(t) >= 4 and any(w in t for w in ("Airfield", "Port", "Naval", "Ground",
+                                                        "Recon", "ASW", "Supply", "City", "Training",
+                                                        "Rest", "Stand")):
+                    hits.append((t, int(p[6]) / 2.0, int(p[7]) / 2.0))
+            # 详情屏右侧「Mission:」标签附近的当前任务文字
+            cur = [h for h in hits if h[2] < 140 and h[1] > 600]
+            print(f"[witp-cmd] 回读当前任务文字: {cur[:3] if cur else '（未识别到，请人工核对）'}")
+        except Exception as e:
+            print(f"[witp-cmd] 回读失败: {e}")
+    print("[witp-cmd] ✓ 任务指令已下发（务必以详情屏/读层为准核对）")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="WitP 前线指挥官与操作手指令工具箱")
+    sub = parser.add_subparsers(dest="action")
+
+    p_staff = sub.add_parser("staff", help="指挥参谋部：出建议书 / --check 体检 / --fix 修复 / --resync 强制重读")
+    p_staff.add_argument("--json", action="store_true")
+    p_staff.add_argument("--scraper", action="store_true")
+    p_staff.add_argument("--no-scraper", action="store_true", help="不强制重读存档（用已缓存 state/ JSON，调试用）")
+    p_staff.add_argument("--saves", action="store_true", help="枚举可用存档（槽位/时间/日期）")
+    p_staff.add_argument("--save", default=None,
+                         help="指定参谋部解析的存档（槽位号 000/002/003、文件名或绝对路径）")
+    p_staff.add_argument("--check", action="store_true", help="参谋部健康体检")
+    p_staff.add_argument("--fix", action="store_true", help="修复参谋部（拉服务+重读存档+复验）")
+    p_staff.add_argument("--resync", action="store_true", help="强制参谋部重读当前存档")
+    p_staff.add_argument("--model", default=None, help="临时指定本回合使用的大模型名称 (如 gemini-3.7-flash-high, step-5-preview)")
+    p_staff.add_argument("--fallbacks", default=None, help="临时指定备用模型链，逗号分隔 (如 claude-sonnet-4-6,step-5-preview)")
+
+    p_model = sub.add_parser("model", help="模型管理：查看候选池 / 测试延迟 / 持久化指定主模型与备用链")
+    p_m_sub = p_model.add_subparsers(dest="model_action")
+    p_m_list = p_m_sub.add_parser("list", help="查看所有可用模型与当前主备配置")
+    p_m_list.add_argument("--test", action="store_true", help="同时测试各模型的网络连通性与延迟")
+    p_m_sub.add_parser("test", help="测试当前主模型与备用链的响应连通性与延迟")
+    p_m_set = p_m_sub.add_parser("set", help="持久化指定主模型与备用链")
+    p_m_set.add_argument("--primary", required=True, help="主模型名称 (如 gemini-3.7-flash-high, step-5-preview)")
+    p_m_set.add_argument("--fallbacks", default=None, help="备用模型链，逗号分隔 (如 claude-sonnet-4-6,step-5-preview)")
+    p_m_set.add_argument("--provider", default=None, help="指定主模型的 Provider 标识（可选）")
+
+    p_launch = sub.add_parser("launch", help="自动重开/启动珊瑚海战役进入第1回合地图")
+
+    p_dest = sub.add_parser("set-dest", help="设编队目标航向")
+    p_dest.add_argument("tf_id", help="编队代号，如 TF14")
+    p_dest.add_argument("hex_x", type=int, help="Hex X")
+    p_dest.add_argument("hex_y", type=int, help="Hex Y")
+    p_dest.add_argument("--probe", default=None, help="强制指定探针 Hex (如 101,155)，绕过 OCR 标定")
+    p_dest.add_argument("--row", type=int, default=None, help="强制指定 T 列表行中心 y，绕过自动定位（TF3 等定位失败时用）")
+    p_dest.add_argument("--deadline", type=float, default=140.0,
+                        help="总时限秒（默认 140）。目标在小地图红框外时小地图跳转会被 clamp，"
+                             "旧实现会无限重试导致挂死；超时限即返回并告警。")
+    p_dest.add_argument("--no-jump", action="store_true",
+                        help="跳过小地图跳转（调用方已自行摆好视野时用）")
+
+    p_cap = sub.add_parser("set-cap", help="设航空队CAP比例")
+    p_cap.add_argument("ag_id", help="航空队代号，如 VF-2")
+    p_cap.add_argument("percent", type=int, choices=[0, 20, 40, 60, 80, 100], help="CAP百分比")
+    p_cap.add_argument("--row", type=int, default=None, help="强制指定列表行中心 y，绕过自动定位")
+    p_cap.add_argument("--cap-row", type=int, default=None,
+                       help="强制指定详情屏 CAP 滑块行的 y（最可靠；"
+                            "不指定时依次用 OCR 定位 → 列表行+42 → 303）")
+    p_cap.add_argument("--list", default=None, choices=["n", "a"],
+                       help="强制指定航空队列表：n=舰载 / a=陆基（读层判不准时用）")
+    p_cap.add_argument("--alt", type=int, default=None, help="同时设定 CAP 高度（英尺），如 15000/6000 分层")
+
+    # ★2026-09-29 新增：批量设 CAP（逐中队全部设定，防漏设）
+    p_capa = sub.add_parser("set-cap-all",
+                            help="批量设CAP：按前缀枚举所有同级中队（防漏设）")
+    p_capa.add_argument("prefix", help="中队名前缀，逗号分隔，如 VF 或 VF,VCS")
+    p_capa.add_argument("percent", type=int, choices=[0, 20, 40, 60, 80, 100],
+                        help="CAP百分比")
+    p_capa.add_argument("--alt", type=int, default=None, help="同时设定 CAP 高度")
+
+    p_srch = sub.add_parser("set-search", help="设航空队对海搜索/反潜搜索比例（侦察纪律）")
+    p_srch.add_argument("ag_id", help="航空队代号，如 VP-11 / No.11 Sqd RAAF / VS-2")
+    p_srch.add_argument("percent", type=int, help="搜索百分比 0-100（按 10 为步进）")
+    p_srch.add_argument("--asw", action="store_true", help="改设 ASW（反潜）比例而非 Search（对海）")
+    p_srch.add_argument("--row", type=int, default=None, help="强制指定列表行中心 y，绕过自动定位")
+    # ★2026-10-04 新增★ N 列表（舰载）OCR 认不出队名（实测整表几乎全乱码），
+    #   `_find_airgroup_row` 因此必然失败 ⇒ 设了等于没设。
+    #   纯像素行序通道：lib/rowfind.py 数文字密度行峰（实测 N 列表 12 行、行距精确 14px，
+    #   起始 y=321），序号从 0 起，与队名 OCR 完全解耦。
+    p_srch.add_argument("--row-index", type=int, default=None,
+                        help="按像素行序定位（0 起）；N 列表 OCR 认不出队名时用")
+    p_srch.add_argument("--row-index-base", type=int, default=None,
+                        help="配合 --row-index：用于重新数行时的参考行数（仅打印对照）")
+
+    p_svg = sub.add_parser("save-game", help="存档到指定槽位（F 键对话框；点【小箭头】而非文字）")
+    p_svg.add_argument("--slot", type=int, default=3, help="槽位号（默认 003）")
+    p_svg.add_argument("--allow-guess", action="store_true",
+                       help="跳过「选中行槽位号回读核对」的守卫（危险：可能覆写其它槽位）")
+
+    sub.add_parser("calibrate-map", help="实测地图几何（像素↔格），全剧本通用；修掉比例写死导致的偏 1 格")
+
+    p_recov = sub.add_parser("recover", help="崩溃自愈：检测游戏进程/画面，必要时重启并载入最新 Autosave")
+    p_recov.add_argument("--force", action="store_true", help="即使画面正常也强制走一遍恢复流程")
+    p_recov.add_argument("--slot-row", type=int, default=212, help="存档列表 000 行的 y（默认 212）")
+
+    # ★ 设置人类玩家阵营（GAMESTYLE 旋钮）★ 决定载入存档后人类执哪一方
+    p_gs = sub.add_parser("set-gamestyle",
+                          help="设主菜单 GAMESTYLE：japanese/allied（人机）/ pbem（邮件对战）/ both（AI对AI）/ h2h（热座）")
+    p_gs.add_argument("side", choices=["japanese", "japan", "allied", "pbem", "both", "h2h"],
+                      help="japanese=AI打日军(人类执盟军) / allied=AI打盟军(人类执日军) / "
+                           "pbem=两人邮件对战 / both=电脑对电脑 / h2h=双人热座 / japan=japanese 的旧别名")
+    p_gs.add_argument("--restart", action="store_true", help="不在主菜单时自动重启游戏服务")
+
+    p_end = sub.add_parser("end-turn", help="过回合 (E + YES)")
+    p_end.add_argument("--timeout", type=int, default=240, help="结算超时秒数")
+
+    p_stat = sub.add_parser("status", help="查看屏幕画面与窗口状态")
+
+    p_sa = sub.add_parser("strike-audit", help="审计航母舰载机的出击能力（任务/搜索占用/可用机/疑似阻断）")
+    p_sa.add_argument("--state", default=None, help="读层 state 目录，默认标准位置")
+
+    p_sm = sub.add_parser("set-mission", help="设置航空队任务（任务可自由指派，不跟中队名走）")
+    p_sm.add_argument("--group", required=True, help="中队名，如 VB-2 / VS-5 / VT-2")
+    p_sm.add_argument("--mission", required=True,
+                      help="Naval Attack / Naval Search / ASW / Rest / Airfield Attack / Port Attack / "
+                           "Ground Attack / Recon / Supply / City / Training / Stand Down")
+    p_sm.add_argument("--no-verify", action="store_true", help="跳过回读核验")
+    p_sm.add_argument("--row", type=int, default=None, help="强制指定列表行中心 y，绕过 OCR 定位")
+
+    # ★ 改 TF 任务（补齐命令面核心缺口；游戏会把 BOMBARDMENT 自动改回 SURFACE）★
+    p_tfm = sub.add_parser("set-tf-mission",
+                           help="改任务编队任务：bombardment / surface / transport / cargo / amphibious / escort …")
+    p_tfm.add_argument("--tf", required=True, help="编队代号，如 TF6")
+    p_tfm.add_argument("--mission", required=True,
+                       help="Bombardment / Surface Combat / Fast Transport / Transport / Cargo / "
+                            "Air Transport / CV Escort / Amphibious / Tanker / Escort")
+    p_tfm.add_argument("--row", type=int, default=None,
+                       help="该 TF 在 T 列表中的行 y（默认按 TF6=317 推断，建议显式给出）")
+
+    # ★ 航空队目标设定（对地/对机场轰炸的必要条件）★
+    #   手册 7.2.1：Target 初值为 Commander's Discretion，必须显式设定，
+    #   否则引擎自行决定（可能不起飞）。实测 game-051：任务=Ground Attack 但
+    #   target=(None,None) ⇒ 对地轰炸从未起飞（战报零空袭记录）。
+    p_tgt = sub.add_parser("set-target",
+                           help="设航空队 Target hex（对地/对机场轰炸的必要条件；否则不会起飞）")
+    p_tgt.add_argument("--group", required=True, help="中队名，如 'Genzan Ku K-1'")
+    p_tgt.add_argument("--hex", required=True, help="目标格，格式 X,Y（如 98,130）")
+    p_tgt.add_argument("--px", default=None,
+                       help="目标在当前地图视口的像素 X,Y（可选；不给则点视口正中）")
+
+    # ★ 地面部队战斗命令（补齐命令面最大缺口）★
+    #   手册 8.2.1/8.4.3：地面部队上岸后**不会自动攻击**，必须由玩家下
+    #   Deliberate/Shock Attack，否则基地归属永不改变。此前 22 局莫港攻不下即此因。
+    p_rs = sub.add_parser("recon-status",
+                          help="侦察态势检查：侦察机队的 search 分配缺口 + 可直接执行的修复命令")
+    p_rs.add_argument("--json", action="store_true", help="以 JSON 输出")
+
+    p_fs = sub.add_parser("fleet-status",
+                          help="己方舰队状态：受损舰清单（航母优先）+ 已沉确认 + 高危告警")
+    p_fs.add_argument("--json", action="store_true", help="以 JSON 输出（供脚本消费）")
+
+    p_go = sub.add_parser("ground-order",
+                          help="地面部队战斗命令（上岸后必须下令攻击，否则永远守在原地）")
+    p_go.add_argument("place", help="地点/基地名，如 \"Port Moresby\"（按列表 Location 列筛选）")
+    p_go.add_argument("order", help="defend / bombard / deliberate / shock")
+    p_go.add_argument("--unit", default=None, help="只对名称含该串的单位下令（可选）")
+    p_go.add_argument("--probe", action="store_true", help="只列出该地点的部队与当前 Combat 列，不下令")
+    p_go.add_argument("--no-verify", action="store_true", help="跳过回读核验")
+
+    p_sg = sub.add_parser("set-game", help="锁定「当前对局」编号（整局的因果记录/归档都以此为准）")
+    p_sg.add_argument("game_id", help="对局目录名，如 game-050")
+    p_ng = sub.add_parser("new-game", help="新建一局（编号=现有最大+1）并锁定为当前对局")
+
+    p_rec = sub.add_parser("record-turn", help="回写本回合因果三元组 (S,D,R)")
+    p_rec.add_argument("--decision", required=True, help="本回合决策与理由")
+    p_rec.add_argument("--result", required=True, help="本回合实际战果")
+    p_rec.add_argument("--orders", default="", help="执行的动作，分号分隔")
+    p_rec.add_argument("--game", default=None, help="对局 ID，默认取最近")
+
+    p_close = sub.add_parser("close-game", help="归档对局战果并追加台账")
+    p_close.add_argument("--outcome", required=True, help="胜负判定，如 日军决定性胜利")
+    p_close.add_argument("--enemy-score", type=int, default=None)
+    p_close.add_argument("--own-score", type=int, default=None)
+    p_close.add_argument("--notes", default="")
+    p_close.add_argument("--game", default=None)
+
+    p_skb = sub.add_parser("skb", help="战略知识库：看状态 / --add 追加**作战策略**教条并提交 Git")
+    p_skb.add_argument("--add", default=None, help="要追加的教条正文（只收作战策略）")
+    p_skb.add_argument("--confidence", type=float, default=None)
+    p_skb.add_argument("--evidence", default=None)
+    p_skb.add_argument("--scope", choices=["strategy", "ops"], default="strategy",
+                       help="strategy=写 SKB（默认，供参谋部战略推理）；ops=写技能库操作笔记（不进参谋提示词）")
+
+    args = parser.parse_args()
+    if args.action == "staff":
+        cmd_staff(args)
+    elif args.action == "launch":
+        cmd_launch(args)
+    elif args.action == "set-dest":
+        cmd_set_dest(args)
+    elif args.action == "set-cap":
+        cmd_set_cap(args)
+    elif args.action == "set-cap-all":
+        cmd_set_cap_all(args)
+    elif args.action == "set-search":
+        cmd_set_search(args)
+    elif args.action == "save-game":
+        cmd_save_game(args)
+    elif args.action == "calibrate-map":
+        cmd_calibrate_map(args)
+    elif args.action == "recover":
+        cmd_recover(args)
+    elif args.action == "set-gamestyle":
+        cmd_set_gamestyle(args)
+    elif args.action == "end-turn":
+        cmd_end_turn(args)
+    elif args.action == "status":
+        cmd_status(args)
+    elif args.action == "strike-audit":
+        cmd_strike_audit(args)
+    elif args.action == "set-mission":
+        cmd_set_mission(args)
+    elif args.action == "set-tf-mission":
+        cmd_set_tf_mission(args)
+    elif args.action == "set-target":
+        cmd_set_target(args)
+    elif args.action == "recon-status":
+        cmd_recon_status(args)
+    elif args.action == "fleet-status":
+        cmd_fleet_status(args)
+    elif args.action == "ground-order":
+        cmd_ground_order(args)
+    elif args.action == "set-game":
+        _set_current_game(args.game_id)
+    elif args.action == "new-game":
+        _new_game(args)
+    elif args.action == "record-turn":
+        cmd_record_turn(args)
+    elif args.action == "close-game":
+        cmd_close_game(args)
+    elif args.action == "skb":
+        cmd_skb(args)
+    elif args.action == "model":
+        cmd_model(args)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()

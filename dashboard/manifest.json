@@ -1,0 +1,7 @@
+{
+  "id": "witp-dashboard",
+  "name": "WitP Dashboard",
+  "version": "1.0.0",
+  "description": "WitP-AE self-iterating agent dashboard",
+  "entry": "plugin_api.py"
+}
