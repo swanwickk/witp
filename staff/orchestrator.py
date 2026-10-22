@@ -1,289 +1,186 @@
 #!/usr/bin/env python3
 """
-WitP-AE Self-Iterating Agent Master Orchestrator
-Executes the three-level nested loop:
-- Inner loop: Perceive -> Understand/Strategize -> Tactical Choice -> Execute -> Verify
-- Middle loop: Maintain game memory & causal logs (S, D, R)
-- Outer loop: Distill lessons into Strategic Knowledge Base (SKB)
+WitP-AE Self-Iterating Agent Master Orchestrator (Modern Memory-Direct Version)
+================================================================================
+核心职责：
+驱动内循环、中循环与外循环的自动化推演闭环：
+1. 认知与决策 (Understand & Strategize)：
+   调用作战参谋本部核心引擎 (witp_staff.py)，结合当前剧本与最新存档、
+   融合 SKB 战略教条，由云端/本地大模型与战术评估引擎生成《作战方案建议书》与标准化 Action。
+2. 动作下发与闭环核验 (Execute & Verify)：
+   调用内存直控转译适配器 (witp_action_adapter.py)，直接操作进程内存（T1 零键鼠通道），
+   完成编队航路点、中队 CAP/搜索扇面、任务航速等指令的高精度写入与双镜像持久化校验。
+3. 因果记录三元组 (Middle Loop Causal Log)：
+   记录 (S_situation, D_decision, R_result) 至当前对局目录，支撑战略复盘与跨局迭代进化。
+4. 回合推进 (Advance Turn)：
+   若指定 --advance，执行安全推进过回合（含终局画面保护与 Autosave 更新等待）。
 """
+
 import os
 import sys
 import json
 import time
-import urllib.request
-import urllib.error
-import yaml
+import argparse
 from typing import Dict, Any, List, Optional
 
-# Ensure lib directory is in sys.path
+_VENV_PY = "/root/.hermes/hermes-agent/venv/bin/python3"
+if sys.executable != _VENV_PY and os.path.exists(_VENV_PY):
+    os.execv(_VENV_PY, [_VENV_PY] + sys.argv)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE_DIR)
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
-from lib import (
-    hex_math,
-    fuel_calc,
-    option_builder,
-    verify,
-    belief_update,
-    perception,
-    executor
-)
+from witp_staff import generate_staff_proposal, _find_active_game_id
+from witp_action_adapter import apply_proposal_actions, _get_active_save_path
+from witp_saves import resolve_save, newest_save, SAVE_DIR
+from lib.executor import end_turn, game_has_ended
 
-CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
-SKB_DIR = os.path.join(BASE_DIR, "skb")
 GAMES_DIR = os.path.join(BASE_DIR, "games")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
 
-def load_config() -> Dict[str, Any]:
-    """Load config.yaml; supports hot-reloading at each turn."""
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    return {}
 
-def load_skb() -> Dict[str, Any]:
-    """Load current doctrines, patterns, and evaluation weights from SKB."""
-    skb = {"doctrines": "", "patterns": [], "eval_weights": {}}
-    doc_path = os.path.join(SKB_DIR, "doctrines.md")
-    if os.path.exists(doc_path):
-        with open(doc_path, "r", encoding="utf-8") as f:
-            skb["doctrines"] = f.read()
-            
-    pat_path = os.path.join(SKB_DIR, "patterns.json")
-    if os.path.exists(pat_path):
-        with open(pat_path, "r", encoding="utf-8") as f:
-            skb["patterns"] = json.load(f)
-            
-    weight_path = os.path.join(SKB_DIR, "eval_weights.json")
-    if os.path.exists(weight_path):
-        with open(weight_path, "r", encoding="utf-8") as f:
-            skb["eval_weights"] = json.load(f)
-    return skb
+def run_single_turn(game_id: Optional[str] = None,
+                    advance_turn: bool = False,
+                    save_spec: Optional[str] = None,
+                    dry_run: bool = False,
+                    override_model: Optional[str] = None,
+                    override_fallbacks: Optional[str] = None) -> Dict[str, Any]:
+    """执行单个完整的回合闭环。"""
+    if not game_id or game_id == "game-001":
+        game_id = _find_active_game_id()
 
-def call_cloud_strategy(prompt_data: Dict[str, Any], config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Call user-configured cloud API (OpenAI compatible) to generate strategic intents.
-    Returns structured JSON intent if successful, else None.
-    """
-    strat_cfg = config.get("strategy_model", {})
-    api_key = strat_cfg.get("api_key", "").strip()
-    base_url = strat_cfg.get("base_url", "").strip().rstrip("/")
-    model = strat_cfg.get("model", "claude-sonnet-4-20250514")
-    
-    if not api_key or not base_url:
-        return None  # Cloud API not yet filled by user
-        
-    url = f"{base_url}/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
-    
-    system_msg = (
-        "You are the Strategic Commander AI for War in the Pacific: Admiral's Edition (Coral Sea 1942).\n"
-        "Given current turn brief, intel, and strategic doctrines, produce a JSON object with your strategic intent.\n"
-        "Output format:\n"
-        "{\n"
-        "  'rationale': '...', \n"
-        "  'tf_intents': [{'tf_id': 'TF16', 'goal_hex': [103, 137], 'intent': 'advance'}],\n"
-        "  'air_intents': [{'ag_id': 'VF-42', 'cap_pct': 100, 'mission': 'CAP'}],\n"
-        "  'recon_priority': 'Track enemy CV carriers east of Rabaul'\n"
-        "}"
+    print(f"\n[orchestrator] 🚀 启动回合推演闭环 (活跃对局: {game_id}, dry_run={dry_run}, advance_turn={advance_turn})")
+
+    # 1. 确定存档路径
+    save_path = _get_active_save_path(save_spec)
+    print(f"[orchestrator] ① 选定当前基准存档: {save_path}")
+
+    # 2. 呼叫参谋本部生成作战方案
+    print("[orchestrator] ② 参谋部研判中 (SKB 教条融合 + 大模型 System 2 推理)...")
+    proposal = generate_staff_proposal(
+        run_scraper=False,
+        game_id=game_id,
+        save_spec=save_spec,
+        override_model=override_model,
+        override_fallbacks=override_fallbacks
     )
-    
-    payload = {
-        "model": model,
-        "temperature": strat_cfg.get("temperature", 0.3),
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": json.dumps(prompt_data, ensure_ascii=False)}
-        ]
-    }
-    
-    try:
-        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            content = data["choices"][0]["message"]["content"]
-            # Extract JSON block
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-            return json.loads(content)
-    except Exception as e:
-        print(f"[orchestrator] Cloud API call failed: {e}")
-        return None
 
-def fallback_rule_strategy(state: Dict[str, Any], skb: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Deterministic tactical baseline when cloud API is unconfigured:
-    Applies proven Coral Sea doctrines directly:
-    1. CAP 100% on fleet carriers
-    2. Advance TF16 toward Louisiades (103, 137) to contest landing
-    """
-    return {
-        "rationale": "Applying verified Coral Sea tactical doctrine (CAP 100% + advance to Louisiades 103,137)",
-        "tf_intents": [
-            {"tf_id": "TF16", "goal_hex": [103, 137], "intent": "advance"}
-        ],
-        "air_intents": [
-            {"ag_id": "VF-42", "cap_pct": 100, "mission": "CAP"}
-        ],
-        "recon_priority": "PBY long-range search of Rabaul / Louisiades axes"
-    }
+    turn_num = proposal.get("turn", 1)
+    turn_date = proposal.get("date", "05/01/42")
+    scenario_name = proposal.get("scenario", "The Battle of the Coral Sea")
+    actions = proposal.get("recommended_actions", [])
 
-def run_single_turn(game_id: str = "game-001", advance_turn: bool = False) -> Dict[str, Any]:
-    """
-    Execute one complete inner-loop cycle:
-    1. Read S_t
-    2. Formulate Strategic Intent
-    3. Build Tactical Options
-    4. Execute
-    5. Verify
-    6. Record Causal Triplet (S, D, R)
-    """
-    config = load_config()
-    skb = load_skb()
-    
-    print("\n[orchestrator] === 1. PERCEIVE: Reading current game state ===")
-    state = perception.capture_state(run_scraper=False)
-    turn_info = state.get("turn", {})
-    turn_date = turn_info.get("date", "05/01/42")
-    turn_num = turn_info.get("turn", 1)
-    print(f"[orchestrator] Current Game Date: {turn_date}, Turn: {turn_num}")
-    
-    print("[orchestrator] === 2. UNDERSTAND & STRATEGIZE ===")
-    # Update qualitative belief map
-    belief_data = belief_update.update_belief_map({}, {"date": turn_date})
-    
-    # Formulate strategy (Cloud API or Fallback Rule)
-    prompt_context = {
-        "turn": turn_info,
-        "brief": state.get("brief", "")[:3000],
-        "belief": belief_data,
-        "doctrines": skb.get("doctrines", "")
-    }
-    
-    intent = call_cloud_strategy(prompt_context, config)
-    if not intent:
-        print("[orchestrator] Cloud API not configured or failed; using verified tactical rules.")
-        intent = fallback_rule_strategy(state, skb)
-    else:
-        print(f"[orchestrator] Strategy from Cloud API: {intent.get('rationale')}")
+    print(f"[orchestrator] ③ 参谋部已出具方案: 《{proposal.get('title', '方案建议书')}》")
+    print(f"               推演日期: {turn_date} | 推荐动作数: {len(actions)}")
+    print(f"               宏观意图: {proposal.get('strategic_intent', '')[:80]}...")
 
-    print("[orchestrator] === 3. TACTICAL OPTIONS & DECISION ===")
-    planned_orders = []
-    
-    # Process TF intents
-    for tfi in intent.get("tf_intents", []):
-        tid = tfi.get("tf_id")
-        goal = tuple(tfi.get("goal_hex", [103, 137]))
-        opts = option_builder.build_tf_destination_options(tid, (106, 142), [goal])
-        # Query Kev-0.8B local decision server via /v1/systemone
-        chosen_hex = opts["options"][0]["coord"]
-        kev_cfg = config.get("kev_server", {})
-        kev_host = kev_cfg.get("host", "127.0.0.1")
-        kev_port = kev_cfg.get("port", 18090)
-        try:
-            criteria_dict = {opt["hex"]: opt["note"] for opt in opts["options"]}
-            kev_req_payload = {
-                "state": f"Task force {tid} at (106,142), strategic goal {goal}. Intel: {intent.get('rationale')}",
-                "model": "kev-0.8b",
-                "questions": {
-                    "hex_choice": {"type": "choice", "criteria": criteria_dict}
-                }
-            }
-            req = urllib.request.Request(
-                f"http://{kev_host}:{kev_port}/v1/systemone",
-                data=json.dumps(kev_req_payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=5) as k_resp:
-                k_data = json.loads(k_resp.read().decode("utf-8"))
-                ans = k_data.get("answers", {}).get("hex_choice", {})
-                best_hex_str = ans.get("choice")
-                conf = ans.get("confidence", 0.0)
-                print(f"[orchestrator] Kev-0.8B System 1 Decision for {tid}: {best_hex_str} (confidence: {conf})")
-                for opt in opts["options"]:
-                    if opt["hex"] == best_hex_str:
-                        chosen_hex = opt["coord"]
-                        break
-        except Exception as e:
-            print(f"[orchestrator] Kev System 1 query bypassed ({e}); using heuristic option.")
-        planned_orders.append({
-            "type": "set_tf_destination",
-            "target_id": tid,
-            "expected_hex": chosen_hex
-        })
-        
-    # Process Air intents
-    for ai in intent.get("air_intents", []):
-        ag_id = ai.get("ag_id")
-        cap = ai.get("cap_pct", 100)
-        planned_orders.append({
-            "type": "set_cap_percent",
-            "target_id": ag_id,
-            "expected_cap_pct": cap
-        })
-        
-    print(f"[orchestrator] Planned {len(planned_orders)} orders: {planned_orders}")
+    # 3. 内存直控执行与即时核验 (T1 零键鼠通道)
+    print("[orchestrator] ④ 启动内存直控适配器执行动作 (T1 零键鼠直写)...")
+    exec_summary = apply_proposal_actions(proposal, save_path=save_path, dry_run=dry_run)
+    print(f"[orchestrator]    下发结果: 总计 {exec_summary['total_actions']} 条 | "
+          f"成功 {exec_summary['applied_count']} 条 | "
+          f"校验通过 {exec_summary['verified_count']} 条 | "
+          f"守卫跳过 {exec_summary['skipped_count']} 条 | "
+          f"失败 {exec_summary['failed_count']} 条")
 
-    print("[orchestrator] === 4. EXECUTE & VERIFY ===")
-    # Send semantic VNC actions to game
-    try:
-        executor.focus_map()
-        for o in planned_orders:
-            if o.get("type") == "set_cap_percent":
-                print(f"[orchestrator] Applying CAP setting to {o.get('target_id')}...")
-                executor.set_cap_percent(4)  # Sets to 100%
-        if advance_turn:
-            print("[orchestrator] Advancing turn: Pressing E and confirming YES...")
-            executor.end_turn(wait_for_save=True, timeout_sec=240)
-    except Exception as exec_err:
-        print(f"[orchestrator] VNC execution note: {exec_err}")
-
-    # Perform verification against state
-    v_report = verify.verify_orders(planned_orders, state)
-    print(f"[orchestrator] Grounding check: {v_report['passed_count']} passed, {v_report['drift_count']} drift/unapplied")
-
-    print("[orchestrator] === 5. RECORD CAUSAL TRIPLET (S, D, R) ===")
+    # 4. 记录因果三元组 (S, D, R)
+    print("[orchestrator] ⑤ 回写因果三元组 (S, D, R) 到对局日志...")
     causal_dir = os.path.join(GAMES_DIR, game_id, "causal_log")
     os.makedirs(causal_dir, exist_ok=True)
-    
+
     triplet = {
         "turn": turn_num,
         "date": turn_date,
-        "timestamp": time.time(),
+        "scenario": scenario_name,
+        "recorded_at": time.time(),
+        "recorded_at_str": time.strftime("%Y-%m-%d %H:%M:%S"),
         "S_situation": {
-            "belief": belief_data,
-            "threats": state.get("threats", {})
+            "scenario": scenario_name,
+            "date": turn_date,
+            "turn": turn_num,
+            "threat_regions": proposal.get("situation_summary", {}).get("threat_regions", {}),
+            "pm_status": proposal.get("pm_status", {}),
+            "carrier_station": proposal.get("carrier_station", {}),
+            "source_save": save_path
         },
         "D_decision": {
-            "intent": intent,
-            "orders": planned_orders
+            "strategic_intent": proposal.get("strategic_intent", ""),
+            "model_used": proposal.get("active_model_used", ""),
+            "recommended_actions": actions,
+            "guards_applied": proposal.get("guards_applied", [])
         },
         "R_result": {
-            "verified": v_report,
-            "losses": {}
+            "execution_summary": {
+                "applied_count": exec_summary["applied_count"],
+                "verified_count": exec_summary["verified_count"],
+                "skipped_count": exec_summary["skipped_count"],
+                "failed_count": exec_summary["failed_count"],
+                "dry_run": dry_run
+            },
+            "action_details": exec_summary["results"]
         }
     }
-    
+
     log_file = os.path.join(causal_dir, f"turn_{turn_num:02d}.json")
     with open(log_file, "w", encoding="utf-8") as f:
         json.dump(triplet, f, indent=2, ensure_ascii=False)
-    print(f"[orchestrator] Saved causal log to {log_file}")
-    
-    return {
-        "status": "success",
+    print(f"[orchestrator]    因果日志已持久化: {log_file}")
+
+    # 5. 推进回合 (Advance Turn)
+    advance_result = {"advanced": False, "note": "未请求推进回合"}
+    if advance_turn and not dry_run:
+        print("[orchestrator] ⑥ 检查终局屏并推进过回合 (E -> YES)...")
+        ended = game_has_ended()
+        if ended:
+            print(f"[orchestrator] ⛔ 游戏已终局 ({ended.get('keyword')})，停止发送过回合指令。")
+            advance_result = {"advanced": False, "ended": True, "details": ended}
+        else:
+            success = end_turn(wait_for_save=True, timeout_sec=300)
+            if success:
+                print("[orchestrator] ✓ 回合结算完成！新 Autosave 存档已生成。")
+                advance_result = {"advanced": True, "success": True}
+            else:
+                print("[orchestrator] ⚠️ 过回合结算未确认，请检查游戏窗口或进程。")
+                advance_result = {"advanced": False, "success": False, "error": "结算超时或窗口未响应"}
+
+    final_result = {
+        "ok": (exec_summary["failed_count"] == 0),
         "turn": turn_num,
         "date": turn_date,
-        "orders_count": len(planned_orders),
-        "verified": v_report["verified"]
+        "scenario": scenario_name,
+        "actions_total": exec_summary["total_actions"],
+        "actions_applied": exec_summary["applied_count"],
+        "actions_verified": exec_summary["verified_count"],
+        "actions_skipped": exec_summary["skipped_count"],
+        "actions_failed": exec_summary["failed_count"],
+        "causal_log": log_file,
+        "advance_result": advance_result
     }
+    return final_result
+
+
+def main():
+    parser = argparse.ArgumentParser(description="WitP-AE 回合推演主编排器")
+    parser.add_argument("--advance", action="store_true", help="下发指令后自动推进过回合 (E -> YES)")
+    parser.add_argument("--game-id", type=str, help="指定对局目录 (如 game-108)")
+    parser.add_argument("--save", type=str, help="指定存档槽位 (如 000)")
+    parser.add_argument("--dry-run", action="store_true", help="试运行模式，不下发实际内存指令")
+    parser.add_argument("--model", type=str, help="临时指定参谋大模型")
+    parser.add_argument("--fallbacks", type=str, help="临时指定备用模型链")
+    args = parser.parse_args()
+
+    res = run_single_turn(
+        game_id=args.game_id,
+        advance_turn=args.advance,
+        save_spec=args.save,
+        dry_run=args.dry_run,
+        override_model=args.model,
+        override_fallbacks=args.fallbacks
+    )
+    print("\n[orchestrator] 执行完毕，最终摘要:")
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+
 
 if __name__ == "__main__":
-    advance = "--advance" in sys.argv
-    print(f"[orchestrator] Running single-turn cycle (advance_turn={advance})...")
-    res = run_single_turn("game-001", advance_turn=advance)
-    print(f"[orchestrator] Result: {res}")
+    main()

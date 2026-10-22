@@ -1,254 +1,79 @@
+# WitP-AE 作战参谋大模型与推演服务配置示例 (config.yaml.example)
+# 使用前请复制为 config.yaml 并填入实际的大模型 API Key 与路径。
+
 strategy_model:
-  base_url: http://127.0.0.1:7863/v1
-  model: cn:glm-5.3-flash
-  api_key: <REDACTED_SET_YOUR_OWN_KEY>
+  base_url: https://api.openai.com/v1
+  model: gpt-4o
+  api_key: "<YOUR_API_KEY>"
   max_tokens: 4096
   temperature: 0.3
-  provider_id: 本地-work-buddy(127.0.0.1:7863)
-  provider_name: 本地-work-buddy(127.0.0.1:7863)
+  provider_id: openai
+  provider_name: OpenAI
   fallbacks:
-  - base_url: http://127.0.0.1:8045/v1
-    model: gemini-3.8-flash-high
-    api_key: <REDACTED_SET_YOUR_OWN_KEY>
-    provider_id: antigravity
-    provider_name: antigravity
+  - base_url: https://api.anthropic.com/v1
+    model: claude-3-5-sonnet-20241022
+    api_key: "<YOUR_ANTHROPIC_KEY>"
+    provider_id: anthropic
+    provider_name: Anthropic
+
 kev_server:
   host: 127.0.0.1
   port: 18090
   model: kev-0.8b
+
 game:
-  save_dir: /root/.wine-witp/drive_c/1108r9/War in the Pacific Admiral's Edition/SAVE
-  exe_dir: /root/.wine-witp/drive_c/1108r9/War in the Pacific Admiral's Edition
-  vnc_display: :98
+  # 游戏 SAVE 目录与主程序目录（根据实际 Wine 或 Windows 路径配置）
+  save_dir: "/path/to/War in the Pacific Admiral's Edition/SAVE"
+  exe_dir: "/path/to/War in the Pacific Admiral's Edition"
+  vnc_display: ":98"
   vnc_port: 5902
+
 providers_pool:
+- id: openai
+  name: OpenAI
+  base_url: https://api.openai.com/v1
+  api_key: "<YOUR_OPENAI_KEY>"
+  models:
+  - gpt-4o
+  - gpt-4o-mini
+  - gpt-4-turbo
+  - o1
+  - o3-mini
+
+- id: anthropic
+  name: Anthropic
+  base_url: https://api.anthropic.com/v1
+  api_key: "<YOUR_ANTHROPIC_KEY>"
+  models:
+  - claude-3-5-sonnet-20241022
+  - claude-3-5-haiku-20241022
+  - claude-3-opus-20240229
+
 - id: opencode
   name: opencode
   base_url: https://opencode.ai/zen/go/v1
-  api_key: sk-YOUR_API_KEY_HERE
+  api_key: "<YOUR_OPENCODE_KEY>"
   models:
-  - deepseek-flash
-  - deepseek-v4-flash
-  - deepseek-v4-flash-vision-exp
   - deepseek-v4-pro
   - deepseek-v4.1-flash
-  - glm-5.1
-  - glm-5.2
   - glm-5.3
   - glm-5.3-flash
-  - gpt-5.6-luna
-  - gpt-6-luna
-  - grok-4.6
-  - grok-4.7
-  - hy3
-  - hy4-preview
-  - kimi-k2.6
-  - kimi-k2.7-code
-  - kimi-k3
-  - longcat-2.0
-  - mimo-v2.5
-  - mimo-v2.5-pro
-  - mimo-v2.6-flash
-  - mimo-v2.6-pro
-  - minimax-m2.5
-  - minimax-m2.7
-  - minimax-m3
-  - muse-spark-1.2-contributor
-  - muse-spark-1.3-contributor
-  - omen-alpha
-  - qwen3.6-plus
-  - qwen3.7-max
-  - qwen3.7-plus
-  - qwen3.8-flash
   - qwen3.8-max
-  - space-bunny-free
-- id: antigravity
-  name: antigravity
-  base_url: http://127.0.0.1:8045/v1
-  api_key: <REDACTED_SET_YOUR_OWN_KEY>
-  models:
-  - claude
-  - claude-3-5-sonnet-20240620
-  - claude-3-5-sonnet-20241022
-  - claude-3-haiku-20240307
-  - claude-haiku-4
-  - claude-haiku-4-5-20251001
-  - claude-opus-4
-  - claude-opus-4-5-20251101
-  - claude-opus-4-5-thinking
-  - claude-opus-4-6
-  - claude-opus-4-6-20260201
-  - claude-opus-4-6-thinking
-  - claude-opus-4.6
-  - claude-opus-4.6-thinking
-  - claude-sonnet-4-5
-  - claude-sonnet-4-5-20250929
-  - claude-sonnet-4-5-thinking
-  - claude-sonnet-4-6
-  - claude-sonnet-4-6-thinking
-  - gemini-2.0-flash-exp
-  - gemini-2.5-flash
-  - gemini-2.5-flash-lite
-  - gemini-2.5-flash-thinking
-  - gemini-2.5-pro
-  - gemini-3-flash
-  - gemini-3-flash-agent
-  - gemini-3-pro
-  - gemini-3-pro-high
-  - gemini-3-pro-image
-  - gemini-3-pro-image-16x9
-  - gemini-3-pro-image-1x1
-  - gemini-3-pro-image-21x9
-  - gemini-3-pro-image-2k
-  - gemini-3-pro-image-2k-16x9
-  - gemini-3-pro-image-2k-1x1
-  - gemini-3-pro-image-2k-21x9
-  - gemini-3-pro-image-2k-3x4
-  - gemini-3-pro-image-2k-4x3
-  - gemini-3-pro-image-2k-9x16
-  - gemini-3-pro-image-3x4
-  - gemini-3-pro-image-4k
-  - gemini-3-pro-image-4k-16x9
-  - gemini-3-pro-image-4k-1x1
-  - gemini-3-pro-image-4k-21x9
-  - gemini-3-pro-image-4k-3x4
-  - gemini-3-pro-image-4k-4x3
-  - gemini-3-pro-image-4k-9x16
-  - gemini-3-pro-image-4x3
-  - gemini-3-pro-image-9x16
-  - gemini-3-pro-low
-  - gemini-3-pro-preview
-  - gemini-3.1-flash-image
-  - gemini-3.1-flash-lite
-  - gemini-3.1-pro
-  - gemini-3.1-pro-high
-  - gemini-3.1-pro-low
-  - gemini-3.1-pro-preview
-  - gemini-3.5-flash
-  - gemini-3.5-flash-extra-low
-  - gemini-3.5-flash-lite
-  - gemini-3.5-flash-low
-  - gemini-3.6-flash
-  - gemini-3.6-flash-high
-  - gemini-3.6-flash-low
-  - gemini-3.6-flash-medium
-  - gemini-3.6-flash-tiered
-  - gemini-3.7-flash
-  - gemini-3.7-flash-high
-  - gemini-3.7-flash-low
-  - gemini-3.7-flash-medium
-  - gemini-3.7-flash-tiered
-  - gemini-3.8-flash
-  - gemini-3.8-flash-high
-  - gemini-3.8-flash-low
-  - gemini-3.8-flash-medium
-  - gemini-3.8-flash-tiered
-  - gemini-3.x-flash
-  - gemini-pro-agent
-  - gpt-3.5-turbo
-  - gpt-3.5-turbo-0125
-  - gpt-3.5-turbo-0613
-  - gpt-3.5-turbo-1106
-  - gpt-3.5-turbo-16k
-  - gpt-4
-  - gpt-4-0125-preview
-  - gpt-4-0613
-  - gpt-4-1106-preview
-  - gpt-4-turbo
-  - gpt-4-turbo-preview
-  - gpt-4o
-  - gpt-4o-2024-05-13
-  - gpt-4o-2024-08-06
-  - gpt-4o-mini
-  - gpt-4o-mini-2024-07-18
-  - gpt-oss-120b-medium
-  - internal-background-task
-- id: 本地-work-buddy(127.0.0.1:7863)
-  name: 本地-work-buddy(127.0.0.1:7863)
-  base_url: http://127.0.0.1:7863/v1
-  api_key: <REDACTED_SET_YOUR_OWN_KEY>
-  models:
-  - cn:auto
-  - cn:balanced-model
-  - cn:deep-model
-  - cn:deepseek-r1-0528
-  - cn:deepseek-r1-0528-lkeap
-  - cn:deepseek-v3-0324
-  - cn:deepseek-v3-0324-lkeap
-  - cn:deepseek-v3-1
-  - cn:deepseek-v3-1-lkeap
-  - cn:deepseek-v3-1-volc
-  - cn:deepseek-v3-2-volc
-  - cn:deepseek-v4-flash
-  - cn:deepseek-v4-pro
-  - cn:deepseek-v4.1-flash
-  - cn:default-1.1
-  - cn:default-1.2
-  - cn:fast-model
-  - cn:glm-4.6
-  - cn:glm-4.6v
-  - cn:glm-5.0-turbo
-  - cn:glm-5.1
-  - cn:glm-5.2
-  - cn:glm-5.3
-  - cn:glm-5.3-flash
-  - cn:glm-5v-turbo
-  - cn:hunyuan-2.0-instruct
-  - cn:hunyuan-chat
-  - cn:hunyuan-image-alpha-edit
-  - cn:hy3
-  - cn:hy3-b
-  - cn:hy3-x
-  - cn:hy4-preview
-  - cn:hy4-preview-f
-  - cn:kimi-k2-instruct-taiji
-  - cn:kimi-k2-thinking
-  - cn:kimi-k2.5
-  - cn:kimi-k2.6
-  - cn:kimi-k2.7
-  - cn:kimi-k2.8-preview
-  - cn:kimi-k3-1
-  - cn:minimax-m2.5
-  - cn:minimax-m2.7
-  - cn:minimax-m3
-  - global:balanced-model
-  - global:deep-model
-  - global:deepseek-v4.1-flash
-  - global:deepseek-v4.1-flash-sg
-  - global:default-model
-  - global:fast-model
-  - global:gemini-3.5-flash
-  - global:glm-5.2
-  - global:glm-5.3
-  - global:glm-5.3-flash
-  - global:gpt-5.3-codex
-  - global:gpt-5.4
-  - global:gpt-5.5
-  - global:gpt-5.6-luna
-  - global:gpt-5.6-sol
-  - global:gpt-5.6-terra
-  - global:gpt-6-astra
-  - global:gpt-image-2.5-sunburst
-  - global:hy3
-  - global:hy4-preview
-  - global:hy4-preview-f
-  - global:kimi-k2.6
-  - global:kimi-k2.8-preview
-  - global:kimi-k3
-  - global:primary-model
-  - global:seedance-2.5
+  - kimi-k3
+  - minimax-m3
+
 - id: stepfun
   name: stepfun
   base_url: https://api.stepfun.com/step_plan/v1
-  api_key: <REDACTED_SET_YOUR_OWN_KEY>
+  api_key: "<YOUR_STEPFUN_KEY>"
   models:
   - step-3.5-flash
-  - step-3.5-flash-2603
   - step-3.7-flash
   - step-5-preview
-  - step-image-edit-2
-  - step-router-v1
-  - stepaudio-2.5-asr
-  - stepaudio-2.5-chat
-  - stepaudio-2.5-realtime
-  - stepaudio-2.5-tts
+
+- id: local-gateway
+  name: local-gateway
+  base_url: http://127.0.0.1:8000/v1
+  api_key: "<YOUR_LOCAL_TOKEN>"
+  models:
+  - local-model

@@ -19,6 +19,8 @@ import time
 import re
 
 _VENV_PY = "/root/.hermes/hermes-agent/venv/bin/python3" if os.path.exists("/root/.hermes/hermes-agent/venv/bin/python3") else sys.executable
+if sys.executable != _VENV_PY and os.path.exists(_VENV_PY):
+    os.execv(_VENV_PY, [_VENV_PY] + sys.argv)
 
 # ──────────────────── TF 目的地设置的辅助函数（第六局新增） ────────────────────
 
@@ -1050,7 +1052,50 @@ def cmd_staff(args):
     if getattr(args, "fallbacks", None):
         cmd += ["--fallbacks", str(args.fallbacks)]
 
-    subprocess.run(cmd)
+    rc = subprocess.run(cmd).returncode
+    if rc == 0 and getattr(args, "apply", False):
+        adapter_script = os.path.join(AGENT_DIR, "witp_action_adapter.py")
+        cmd_app = [_VENV_PY, adapter_script, "--latest"]
+        if getattr(args, "save", None):
+            cmd_app.extend(["--save", str(args.save)])
+        if getattr(args, "dry_run", False):
+            cmd_app.append("--dry-run")
+        print("\n[witp-cmd] 正在通过 T1 内存直控自动下发上述方案建议...")
+        subprocess.run(cmd_app)
+
+def cmd_apply_proposal(args):
+    """将参谋部作战方案通过内存直控（T1 零键鼠通道）直接下发给游戏进程"""
+    adapter_script = os.path.join(AGENT_DIR, "witp_action_adapter.py")
+    cmd = [_VENV_PY, adapter_script]
+    if getattr(args, "proposal", None):
+        cmd.extend(["--proposal", str(args.proposal)])
+    if getattr(args, "save", None):
+        cmd.extend(["--save", str(args.save)])
+    if getattr(args, "dry_run", False):
+        cmd.append("--dry-run")
+    if getattr(args, "latest", False) or not getattr(args, "proposal", None):
+        cmd.append("--latest")
+    rc = subprocess.run(cmd).returncode
+    sys.exit(rc)
+
+def cmd_run_turn(args):
+    """一键自动化推演一个回合：参谋出方案 -> 内存直控执行 -> 回写因果记录 -> (可选)过回合"""
+    orch_script = os.path.join(AGENT_DIR, "orchestrator.py")
+    cmd = [_VENV_PY, orch_script]
+    if getattr(args, "advance", False):
+        cmd.append("--advance")
+    if getattr(args, "dry_run", False):
+        cmd.append("--dry-run")
+    if getattr(args, "save", None):
+        cmd.extend(["--save", str(args.save)])
+    if getattr(args, "game_id", None):
+        cmd.extend(["--game-id", str(args.game_id)])
+    if getattr(args, "model", None):
+        cmd.extend(["--model", str(args.model)])
+    if getattr(args, "fallbacks", None):
+        cmd.extend(["--fallbacks", str(args.fallbacks)])
+    rc = subprocess.run(cmd).returncode
+    sys.exit(rc)
 
 def cmd_model(args):
     """参谋大模型管理：查看候选池 / 测试响应连通性 / 指定主模型与备用链"""
@@ -2767,8 +2812,23 @@ def main():
     p_staff.add_argument("--check", action="store_true", help="参谋部健康体检")
     p_staff.add_argument("--fix", action="store_true", help="修复参谋部（拉服务+重读存档+复验）")
     p_staff.add_argument("--resync", action="store_true", help="强制参谋部重读当前存档")
+    p_staff.add_argument("--apply", action="store_true", help="方案生成后立即通过内存直控自动下发推荐动作")
+    p_staff.add_argument("--dry-run", action="store_true", help="配合 --apply 试运行，不下发实际内存指令")
     p_staff.add_argument("--model", default=None, help="临时指定本回合使用的大模型名称 (如 gemini-3.7-flash-high, step-5-preview)")
     p_staff.add_argument("--fallbacks", default=None, help="临时指定备用模型链，逗号分隔 (如 claude-sonnet-4-6,step-5-preview)")
+
+    p_apply = sub.add_parser("apply-proposal", help="将参谋部方案通过 T1 内存直控直接下发到游戏进程")
+    p_apply.add_argument("--proposal", default=None, help="指定方案建议书 JSON 路径")
+    p_apply.add_argument("--save", default=None, help="指定基准存档槽位")
+    p_apply.add_argument("--dry-run", action="store_true", help="试运行模式，不下发实际内存指令")
+
+    p_rt = sub.add_parser("run-turn", help="一键自动化推演一个回合：参谋研判 -> 内存直控下发 -> 回写因果记录 -> (可选)推进过回合")
+    p_rt.add_argument("--advance", action="store_true", help="下发后自动推进过回合 (E -> YES)")
+    p_rt.add_argument("--save", default=None, help="指定基准存档槽位")
+    p_rt.add_argument("--game-id", default=None, help="指定对局编号")
+    p_rt.add_argument("--dry-run", action="store_true", help="试运行模式")
+    p_rt.add_argument("--model", default=None, help="临时指定大模型")
+    p_rt.add_argument("--fallbacks", default=None, help="临时指定备用模型链")
 
     p_model = sub.add_parser("model", help="模型管理：查看候选池 / 测试延迟 / 持久化指定主模型与备用链")
     p_m_sub = p_model.add_subparsers(dest="model_action")
@@ -2975,6 +3035,10 @@ def main():
         cmd_close_game(args)
     elif args.action == "skb":
         cmd_skb(args)
+    elif args.action == "apply-proposal":
+        cmd_apply_proposal(args)
+    elif args.action == "run-turn":
+        cmd_run_turn(args)
     elif args.action == "model":
         cmd_model(args)
     else:

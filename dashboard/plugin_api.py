@@ -722,9 +722,19 @@ async def post_run_turn(request: web.Request) -> web.Response:
         except Exception:
             body = {}
         advance = body.get("advance_turn", False)
-        cmd = ["python3", ORCHESTRATOR_PY]
+        dry_run = body.get("dry_run", False)
+        save_slot = body.get("save")
+        model = body.get("model")
+
+        cmd = [sys.executable, ORCHESTRATOR_PY]
         if advance:
             cmd.append("--advance")
+        if dry_run:
+            cmd.append("--dry-run")
+        if save_slot:
+            cmd.extend(["--save", str(save_slot)])
+        if model:
+            cmd.extend(["--model", str(model)])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,

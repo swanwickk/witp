@@ -2579,7 +2579,12 @@ def _vnc_key(key: str) -> str:
 def _screen_hash() -> str:
     """整屏像素 md5（只作“画面是否变化”判据，不做 OCR/不取坐标）。"""
     try:
-        out = subprocess.run(["import", "-window", "root", "png:-"],
+        # 优先截取游戏窗口，避免 Xvnc root 未合成导致全黑
+        p = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", "War in the Pacific"],
+                           env=dict(os.environ, DISPLAY=DISPLAY, HOME="/root"),
+                           timeout=5, capture_output=True, text=True)
+        wid = p.stdout.strip().split()[0] if (p.returncode == 0 and p.stdout.strip()) else "root"
+        out = subprocess.run(["import", "-window", wid, "png:-"],
                              env=dict(os.environ, DISPLAY=DISPLAY, HOME="/root"),
                              timeout=25, capture_output=True)
         if out.returncode == 0 and out.stdout:
